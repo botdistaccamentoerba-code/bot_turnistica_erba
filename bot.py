@@ -1,1989 +1,1120 @@
-#gist id d6b7f54ec9ab952abbec068dc2fdf0c1 # apikey rnd_vwifq7NnYes2wGlWKDOkfwpbGN0i
-import os
 import logging
 import sqlite3
-import json
-import csv
-import io
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, filters
-
-# Import sistema backup e keep-alive
-from backup_system import enhanced_restore_on_startup, start_backup_system
-from keep_alive import start_keep_alive
-
-# Import dati precompilati
-from data_precompilati import PERSONALE_PRECOMPILATO, MEZZI_PRECOMPILATI, TIPOLOGIE_INTERVENTO
-
-# Configurazione
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-DATABASE_NAME = 'vigili.db'
-
-# Configurazione logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Stati conversazione
-(
-    ADD_PERSONNEL_QUALIFICATION, ADD_PERSONNEL_NAME, ADD_PERSONNEL_LICENSE, 
-    ADD_PERSONNEL_NAUTICAL, ADD_PERSONNEL_SAF, ADD_PERSONNEL_TPSS,
-    ADD_VEHICLE_PLATE, ADD_VEHICLE_MODEL,
-    NEW_INTERVENTION_REPORT_NUM, NEW_INTERVENTION_YEAR, NEW_INTERVENTION_EXIT_TIME, 
-    NEW_INTERVENTION_RETURN_TIME, NEW_INTERVENTION_ADDRESS, NEW_INTERVENTION_TYPE,
-    NEW_INTERVENTION_SQUAD_LEADER, NEW_INTERVENTION_DRIVER, NEW_INTERVENTION_PARTICIPANTS, NEW_INTERVENTION_VEHICLES,
-    SEARCH_REPORT_NUM, SEARCH_REPORT_YEAR,
-    EXPORT_SELECT_YEAR,
-    MANAGE_PERSONNEL_SELECTED, MANAGE_PERSONNEL_ACTION, UPDATE_LICENSE_CONFIRM,
-    UPDATE_QUALIFICATION_CONFIRM, UPDATE_NAUTICAL_CONFIRM, UPDATE_SAF_TPSS_CONFIRM,
-    MODIFICA_VIGILE_SELECT, MODIFICA_CAMPO_SELECT, MODIFICA_NUOVO_VALORE,
-    NEW_INTERVENTION_REPORT_PROGRESSIVO,
-    CONFERMA_RICARICA_DATI
-) = range(32)
-
-class VigiliBot:
-    def __init__(self, token):
-        self.token = token
-        self.application = None
-        self.init_db()
-        self.carica_dati_precompilati()
-    
-    def init_db(self):
-        """Inizializza database SQLite"""
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        # Tabella interventi CON TIPOLOGIA
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS interventions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                report_number TEXT NOT NULL,
-                year INTEGER NOT NULL,
-                exit_time TEXT NOT NULL,
-                return_time TEXT,
-                address TEXT NOT NULL,
-                intervention_type TEXT DEFAULT 'Incendio',
-                squad_leader TEXT NOT NULL,
-                driver TEXT NOT NULL,
-                participants TEXT NOT NULL,
-                vehicles_used TEXT NOT NULL,
-                created_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(report_number, year)
-            )
-        ''')
-        
-        # Tabella utenti
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE,
-                username TEXT,
-                full_name TEXT,
-                role TEXT DEFAULT 'user',
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Tabella richieste accesso
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS access_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE,
-                username TEXT,
-                full_name TEXT,
-                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'pending'
-            )
-        ''')
-        
-        # Tabella personale
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS personnel (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                full_name TEXT NOT NULL,
-                qualification TEXT,
-                license_grade TEXT,
-                has_nautical_license BOOLEAN DEFAULT FALSE,
-                is_saf BOOLEAN DEFAULT FALSE,
-                is_tpss BOOLEAN DEFAULT FALSE,
-                squadra_notturna TEXT,
-                squadra_serale TEXT,
-                squadra_domenicale TEXT,
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Tabella mezzi
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS vehicles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                license_plate TEXT UNIQUE NOT NULL,
-                model TEXT NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Tabella admin
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS admins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("✅ Database inizializzato")
-    
-    def carica_dati_precompilati(self):
-        """Carica i dati precompilati nel database se non esistono"""
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        # Carica personale precompilato
-        c.execute('SELECT COUNT(*) FROM personnel')
-        count_personale = c.fetchone()[0]
-        
-        if count_personale == 0:
-            for vigile in PERSONALE_PRECOMPILATO:
-                c.execute('''
-                    INSERT OR IGNORE INTO personnel 
-                    (full_name, qualification, license_grade, has_nautical_license, is_saf, is_tpss, squadra_notturna, squadra_serale, squadra_domenicale)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    vigile['nome'],
-                    vigile['qualifica'],
-                    vigile['patente'],
-                    vigile['nautica'],
-                    vigile['saf'],
-                    vigile['tpss'],
-                    vigile.get('squadra_notturna', ''),
-                    vigile.get('squadra_serale', ''),
-                    vigile.get('squadra_domenicale', '')
-                ))
-            logger.info(f"✅ Caricati {len(PERSONALE_PRECOMPILATO)} vigili precompilati")
-        
-        # Carica mezzi precompilati
-        c.execute('SELECT COUNT(*) FROM vehicles')
-        count_mezzi = c.fetchone()[0]
-        
-        if count_mezzi == 0:
-            for mezzo in MEZZI_PRECOMPILATI:
-                c.execute('''
-                    INSERT OR IGNORE INTO vehicles (license_plate, model)
-                    VALUES (?, ?)
-                ''', (mezzo['targa'], mezzo['modello']))
-            logger.info(f"✅ Caricati {len(MEZZI_PRECOMPILATI)} mezzi precompilati")
-        
-        conn.commit()
-        conn.close()
-    
-    async def ricarica_dati_precompilati(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Forza la ricarica dei dati precompilati (COMANDO ADMIN)"""
-        # Conferma prima di cancellare tutto!
-        keyboard = [
-            ['✅ Sì, ricarica tutto', '❌ No, annulla']
-        ]
-        
-        await update.message.reply_text(
-            "⚠️ **ATTENZIONE: RICARICA DATI** ⚠️\n\n"
-            "Questo comando CANCELLERÀ:\n"
-            "• Tutti i vigili attuali\n" 
-            "• Tutti i mezzi attuali\n"
-            "• E ricaricherà i dati precompilati\n\n"
-            "Sei sicuro di voler continuare?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        
-        return CONFERMA_RICARICA_DATI
-    
-    def setup_admins_and_users(self):
-        """Configura admin e utenti automaticamente all'avvio"""
-        admin_ids = [1816045269, 653425963, 693843502]
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        # Configura admin
-        for admin_id in admin_ids:
-            # Inserisci nella tabella admins
-            c.execute('INSERT OR IGNORE INTO admins (telegram_id) VALUES (?)', (admin_id,))
-            # Inserisci anche nella tabella users come attivo
-            c.execute('''
-                INSERT OR REPLACE INTO users (telegram_id, username, full_name, role, is_active) 
-                VALUES (?, 'admin', 'Admin User', 'user', TRUE)
-            ''', (admin_id,))
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"👑 Admin configurati automaticamente: {admin_ids}")
-    
-    def get_main_keyboard(self, is_admin=False):
-            """Tastiera principale migliorata - SOLO FUNZIONI ESSENZIALI"""
-        keyboard = [
-            ['📋 Nuovo Intervento', '📊 Ultimi Interventi'],
-            ['📈 Statistiche', '🔍 Cerca Rapporto'],
-            ['📁 Esporta Dati', '🔄 Health Check']
-        ]
-        if is_admin:
-            keyboard.append(['👥 Gestione Richieste'])
-            keyboard.append(['👨‍🚒 Modifica Vigile', '⚙️ Altro'])
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
-    def is_admin(self, user_id):
-        """Verifica se utente è admin"""
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT * FROM admins WHERE telegram_id = ?', (user_id,))
-        admin = c.fetchone()
-        conn.close()
-        return admin is not None
-
-    def get_available_years(self):
-        """Recupera tutti gli anni disponibili nel database"""
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT DISTINCT year FROM interventions ORDER BY year DESC')
-        years = [str(row[0]) for row in c.fetchall()]
-        conn.close()
-        return years
-
-    # 🔥 GESTIONE UTENTI E ACCESSO
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        telegram_id = user.id
-        
-        # Lista degli admin pre-autorizzati
-        admin_ids = [1816045269, 653425963, 693843502]
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        # Se l'utente è nella lista admin, approvalo automaticamente
-        if telegram_id in admin_ids:
-            c.execute('''
-                INSERT OR REPLACE INTO users (telegram_id, username, full_name, role, is_active) 
-                VALUES (?, ?, ?, 'user', TRUE)
-            ''', (telegram_id, user.username, user.full_name))
-            
-            # Assicurati che sia nella tabella admins
-            c.execute('INSERT OR IGNORE INTO admins (telegram_id) VALUES (?)', (telegram_id,))
-            
-            conn.commit()
-            conn.close()
-            
-            is_admin = self.is_admin(telegram_id)
-            await update.message.reply_text(
-                f"👑 Benvenuto Admin {user.full_name}!\n"
-                f"Sei stato riconosciuto automaticamente come amministratore.",
-                reply_markup=self.get_main_keyboard(is_admin)
-            )
-        else:
-            # Per utenti normali, richiesta di accesso
-            c.execute('SELECT * FROM users WHERE telegram_id = ? AND is_active = TRUE', (telegram_id,))
-            existing_user = c.fetchone()
-            
-            if existing_user:
-                is_admin = self.is_admin(telegram_id)
-                await update.message.reply_text(
-                    f"Benvenuto {user.full_name}!\n"
-                    f"Sei registrato come: {'Admin' if is_admin else 'User'}",
-                    reply_markup=self.get_main_keyboard(is_admin)
-                )
-            else:
-                c.execute('''
-                    INSERT OR REPLACE INTO access_requests (telegram_id, username, full_name, status)
-                    VALUES (?, ?, ?, 'pending')
-                ''', (telegram_id, user.username, user.full_name))
-                conn.commit()
-                await update.message.reply_text(
-                    f"Ciao {user.full_name}!\n"
-                    "La tua richiesta di accesso è stata inviata agli amministratori.\n"
-                    "Riceverai una notifica quando verrà approvata.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-        conn.close()
-
-    # 🔥 GESTIONE MESSAGGI PRINCIPALI
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        message_text = update.message.text
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT * FROM users WHERE telegram_id = ? AND is_active = TRUE', (user.id,))
-        user_data = c.fetchone()
-        conn.close()
-        
-        if not user_data:
-            await update.message.reply_text("Il tuo account non è ancora stato autorizzato.")
-            return
-        
-        is_admin = self.is_admin(user.id)
-        
-        # Gestione conferma ricarica dati
-        if context.user_data.get('awaiting_reload_confirmation'):
-            if message_text == '✅ Sì, ricarica tutto':
-                # Procedi con la ricarica
-                conn = sqlite3.connect(DATABASE_NAME)
-                c = conn.cursor()
-                
-                # Conta quanti record ci sono prima
-                c.execute('SELECT COUNT(*) FROM personnel')
-                count_vigili_prima = c.fetchone()[0]
-                c.execute('SELECT COUNT(*) FROM vehicles') 
-                count_mezzi_prima = c.fetchone()[0]
-                
-                # Svuota le tabelle (ATTENZIONE: cancella i dati esistenti!)
-                c.execute('DELETE FROM personnel')
-                c.execute('DELETE FROM vehicles')
-                
-                conn.commit()
-                conn.close()
-                
-                # Ricarica i dati precompilati
-                self.carica_dati_precompilati()
-                
-                # Conta quanti record ci sono dopo
-                conn = sqlite3.connect(DATABASE_NAME)
-                c = conn.cursor()
-                c.execute('SELECT COUNT(*) FROM personnel')
-                count_vigili_dopo = c.fetchone()[0]
-                c.execute('SELECT COUNT(*) FROM vehicles')
-                count_mezzi_dopo = c.fetchone()[0]
-                conn.close()
-                
-                # Reset dello stato
-                context.user_data['awaiting_reload_confirmation'] = False
-                
-                await update.message.reply_text(
-                    f"✅ **DATI RICARICATI CON SUCCESSO!**\n\n"
-                    f"📊 **PRIMA:**\n"
-                    f"• 👥 Vigili: {count_vigili_prima}\n"
-                    f"• 🚗 Mezzi: {count_mezzi_prima}\n\n"
-                    f"📊 **DOPO:**\n" 
-                    f"• 👥 Vigili: {count_vigili_dopo}\n"
-                    f"• 🚗 Mezzi: {count_mezzi_dopo}\n\n"
-                    f"🔄 Dati precompilati ricaricati!",
-                    reply_markup=self.get_main_keyboard(is_admin)
-                )
-                return
-            
-            elif message_text in ['❌ No, annulla', '🔙 Indietro']:
-                # Annulla l'operazione
-                context.user_data['awaiting_reload_confirmation'] = False
-                await update.message.reply_text(
-                    "❌ Operazione annullata. Nessun dato è stato modificato.",
-                    reply_markup=self.get_main_keyboard(is_admin)
-                )
-                return
-        
-        if message_text == '📋 Nuovo Intervento':
-            await self.start_new_intervention(update, context)
-        elif message_text == '📊 Ultimi Interventi':
-            await self.show_last_interventions(update, context)
-        elif message_text == '📈 Statistiche':
-            await self.show_statistics(update, context)
-        elif message_text == '🔍 Cerca Rapporto':
-            await self.search_report_start(update, context)
-        elif message_text == '📁 Esporta Dati':
-            await self.export_data_menu(update, context)
-        elif message_text == '🔄 Health Check':
-            await self.health_check(update, context)
-        elif message_text == '👥 Gestione Richieste' and is_admin:
-            await self.manage_requests(update, context)
-        elif message_text == '🔄 Ricarica Dati Precompilati' and is_admin:
-            context.user_data['awaiting_reload_confirmation'] = True
-            await self.ricarica_dati_precompilati(update, context)
-        elif message_text == '⚙️ Altro' and is_admin:
-            await self.menu_altro(update, context)
-        else:
-            await update.message.reply_text("Comando non riconosciuto.")
-
-    async def menu_altro(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Menu funzioni aggiuntive per admin"""
-        keyboard = [
-            ['📋 Lista Vigili Completa', '🚗 Lista Mezzi Completa'],
-            ['🔄 Ricarica Dati Precompilati', '📊 Statistiche Avanzate'],
-            ['🔙 Indietro']
-        ]
-        
-        await update.message.reply_text(
-            "⚙️ **MENU FUNZIONI AGGIUNTIVE**\n\n"
-            "Seleziona un'opzione:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-
-    # 🔥 GESTIONE INTERVENTI CON TIPOLOGIA MIGLIORATA
-    async def start_new_intervention(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Pulsanti per progressivo o nuovo
-        keyboard = [
-            ['🔄 Progressivo', '📝 Nuovo Rapporto'],
-            ['🔙 Indietro']
-        ]
-        
-        await update.message.reply_text(
-            "📋 **NUOVO INTERVENTO**\n\n"
-            "Vuoi continuare da un rapporto precedente o crearne uno nuovo?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return NEW_INTERVENTION_REPORT_NUM
-
-    async def new_intervention_report_num(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.cancel(update, context)
-        
-        if update.message.text == '🔄 Progressivo':
-            # Recupera ultimi 4 interventi
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('''
-                SELECT report_number, year FROM interventions 
-                ORDER BY created_at DESC LIMIT 4
-            ''')
-            ultimi_interventi = c.fetchall()
-            conn.close()
-            
-            if ultimi_interventi:
-                keyboard = []
-                for rapporto, anno in ultimi_interventi:
-                    keyboard.append([f"📋 {rapporto}/{anno} → {int(rapporto)+1}/{anno}"])
-                keyboard.append(['🔙 Nuovo Rapporto'])
-                
-                await update.message.reply_text(
-                    "🔄 **SELEZIONA RAPPORTO PRECEDENTE**\n\n"
-                    "Scegli da quale rapporto continuare:",
-                    reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                )
-                return NEW_INTERVENTION_REPORT_PROGRESSIVO
-            else:
-                await update.message.reply_text("❌ Nessun intervento precedente trovato.")
-        
-        await update.message.reply_text(
-            "Inserisci il numero del rapporto:",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return NEW_INTERVENTION_REPORT_NUM
-
-    async def new_intervention_report_progressivo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Nuovo Rapporto':
-            await update.message.reply_text("Inserisci il numero del rapporto:")
-            return NEW_INTERVENTION_REPORT_NUM
-        
-        # Estrai il rapporto precedente e calcola il progressivo
-        testo = update.message.text
-        parti = testo.split(' → ')
-        if len(parti) == 2:
-            rapporto_progressivo = parti[1]
-            rapporto_num, anno = rapporto_progressivo.split('/')
-            context.user_data['report_number'] = rapporto_num
-            context.user_data['year'] = anno
-            
-            await update.message.reply_text(
-                f"✅ Progressivo impostato: {rapporto_num}/{anno}\n\n"
-                f"Inserisci data e ora di uscita (formato: GG/MM/AAAA HH:MM):",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            return NEW_INTERVENTION_EXIT_TIME
-        
-        await update.message.reply_text("Inserisci il numero del rapporto:")
-        return NEW_INTERVENTION_REPORT_NUM
-
-    async def new_intervention_year(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['year'] = update.message.text
-        await update.message.reply_text("Inserisci data e ora di uscita (formato: GG/MM/AAAA HH:MM):")
-        return NEW_INTERVENTION_EXIT_TIME
-
-    async def new_intervention_exit_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['exit_time'] = update.message.text
-        await update.message.reply_text("Inserisci data e ora di rientro (formato: GG/MM/AAAA HH:MM):")
-        return NEW_INTERVENTION_RETURN_TIME
-
-    async def new_intervention_return_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['return_time'] = update.message.text
-        await update.message.reply_text("Inserisci l'indirizzo dell'intervento:")
-        return NEW_INTERVENTION_ADDRESS
-
-    async def new_intervention_address(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['address'] = update.message.text
-        
-        # Selezione tipologia intervento con lista precompilata + "Altro"
-        keyboard = []
-        for tipologia in TIPOLOGIE_INTERVENTO:
-            keyboard.append([tipologia])
-        keyboard.append(['📝 Altra Tipologia'])
-        keyboard.append(['Annulla'])
-        
-        await update.message.reply_text(
-            "🔥 **SELEZIONA TIPOLOGIA INTERVENTO**",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return NEW_INTERVENTION_TYPE
-
-    async def new_intervention_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        if update.message.text == '📝 Altra Tipologia':
-            await update.message.reply_text(
-                "Inserisci la nuova tipologia di intervento:",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            context.user_data['awaiting_custom_type'] = True
-            return NEW_INTERVENTION_TYPE
-        
-        if context.user_data.get('awaiting_custom_type'):
-            context.user_data['intervention_type'] = update.message.text
-            context.user_data['awaiting_custom_type'] = False
-        else:
-            context.user_data['intervention_type'] = update.message.text
-        
-        # Continua con selezione caposquadra
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT * FROM personnel WHERE is_active = TRUE')
-        personnel = c.fetchall()
-        conn.close()
-        
-        if personnel:
-            keyboard = [[f"👨‍🚒 {p[1]}"] for p in personnel]
-            keyboard.append(['Annulla'])
-            await update.message.reply_text(
-                "👨‍🚒 **SELEZIONA IL CAPOSQUADRA**",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return NEW_INTERVENTION_SQUAD_LEADER
-        else:
-            await update.message.reply_text("Inserisci il nome del caposquadra:")
-            return NEW_INTERVENTION_SQUAD_LEADER
-
-    async def new_intervention_squad_leader(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        # Estrai solo il nome dalla selezione
-        squad_leader_text = update.message.text
-        if '👨‍🚒' in squad_leader_text:
-            squad_leader_name = squad_leader_text.replace('👨‍🚒 ', '').strip()
-        else:
-            squad_leader_name = squad_leader_text
-        
-        context.user_data['squad_leader'] = squad_leader_name
-        
-        # Recupera solo il personale con patente adatta per autista
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('''
-            SELECT full_name, license_grade 
-            FROM personnel 
-            WHERE is_active = TRUE 
-            AND license_grade IN ('IIIE', 'III', 'II', 'I')
-            ORDER BY 
-                CASE license_grade 
-                    WHEN 'IIIE' THEN 1
-                    WHEN 'III' THEN 2 
-                    WHEN 'II' THEN 3
-                    WHEN 'I' THEN 4
-                    ELSE 5
-                END,
-                full_name
-        ''')
-        drivers = c.fetchall()
-        conn.close()
-        
-        if drivers:
-            keyboard = []
-            for driver in drivers:
-                keyboard.append([f"🚗 {driver[0]} ({driver[1]})"])
-            keyboard.append(['Annulla'])
-            
-            await update.message.reply_text(
-                "👨‍✈️ **SELEZIONA AUTISTA**\n"
-                "Sono mostrati solo i vigili con patente adatta:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Nessun autista disponibile con patente adatta.\n"
-                "Inserisci manualmente il nome dell'autista:"
-            )
-        return NEW_INTERVENTION_DRIVER
-
-    async def new_intervention_driver(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        # Estrai solo il nome dalla selezione
-        driver_text = update.message.text
-        if '🚗' in driver_text and '(' in driver_text:
-            driver_name = driver_text.split('🚗 ')[1].split(' (')[0].strip()
-        else:
-            driver_name = driver_text
-        
-        context.user_data['driver'] = driver_name
-        
-        # Mostra tutti i vigili per selezione partecipanti
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT full_name FROM personnel WHERE is_active = TRUE ORDER BY full_name')
-        all_personnel = c.fetchall()
-        conn.close()
-        
-        if all_personnel:
-            # Crea tastiera con checkbox
-            keyboard = []
-            for person in all_personnel:
-                keyboard.append([f"☐ {person[0]}"])
-            keyboard.append(['✅ Conferma Partecipanti'])
-            keyboard.append(['Annulla'])
-            
-            context.user_data['available_personnel'] = [p[0] for p in all_personnel]
-            context.user_data['selected_participants'] = []
-            
-            await update.message.reply_text(
-                "👥 **SELEZIONA PARTECIPANTI**\n\n"
-                "Clicca sui nomi per selezionare/deselezionare.\n"
-                "Quando hai finito, clicca 'Conferma Partecipanti'",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return NEW_INTERVENTION_PARTICIPANTS
-        else:
-            await update.message.reply_text(
-                "Inserisci i nomi dei vigili partecipanti (separati da virgola):",
-                reply_markup=ReplyKeyboardRemove()
-            )
-            return NEW_INTERVENTION_PARTICIPANTS
-
-    async def new_intervention_participants(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        if update.message.text == '✅ Conferma Partecipanti':
-            # Conferma selezione
-            participants = context.user_data.get('selected_participants', [])
-            if not participants:
-                await update.message.reply_text("❌ Nessun partecipante selezionato. Seleziona almeno un partecipante.")
-                return NEW_INTERVENTION_PARTICIPANTS
-            
-            context.user_data['participants'] = participants
-            
-            # Mostra mezzi disponibili
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('SELECT license_plate, model FROM vehicles WHERE is_active = TRUE')
-            vehicles = c.fetchall()
-            conn.close()
-            
-            if vehicles:
-                keyboard = [[f"🚒 {v[0]} - {v[1]}"] for v in vehicles]
-                keyboard.append(['Annulla'])
-                await update.message.reply_text(
-                    "🚒 **SELEZIONA MEZZI UTILIZZATI**",
-                    reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                )
-                return NEW_INTERVENTION_VEHICLES
-            else:
-                await update.message.reply_text("Inserisci i mezzi utilizzati (separati da virgola):")
-                return NEW_INTERVENTION_VEHICLES
-        
-        # Gestione selezione/deselezione partecipanti
-        person_text = update.message.text
-        if person_text.startswith('☐ '):
-            person_name = person_text[2:].strip()
-            if 'selected_participants' not in context.user_data:
-                context.user_data['selected_participants'] = []
-            if person_name not in context.user_data['selected_participants']:
-                context.user_data['selected_participants'].append(person_name)
-            
-            # Aggiorna tastiera
-            keyboard = []
-            for person in context.user_data['available_personnel']:
-                if person in context.user_data['selected_participants']:
-                    keyboard.append([f"☑️ {person}"])
-                else:
-                    keyboard.append([f"☐ {person}"])
-            keyboard.append(['✅ Conferma Partecipanti'])
-            keyboard.append(['Annulla'])
-            
-            await update.message.reply_text(
-                f"👥 **PARTECIPANTI SELEZIONATI: {len(context.user_data['selected_participants'])}**\n\n"
-                "Continua a selezionare o clicca 'Conferma Partecipanti'",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return NEW_INTERVENTION_PARTICIPANTS
-        
-        elif person_text.startswith('☑️ '):
-            person_name = person_text[3:].strip()
-            if 'selected_participants' in context.user_data and person_name in context.user_data['selected_participants']:
-                context.user_data['selected_participants'].remove(person_name)
-            
-            # Aggiorna tastiera
-            keyboard = []
-            for person in context.user_data['available_personnel']:
-                if person in context.user_data['selected_participants']:
-                    keyboard.append([f"☑️ {person}"])
-                else:
-                    keyboard.append([f"☐ {person}"])
-            keyboard.append(['✅ Conferma Partecipanti'])
-            keyboard.append(['Annulla'])
-            
-            await update.message.reply_text(
-                f"👥 **PARTECIPANTI SELEZIONATI: {len(context.user_data['selected_participants'])}**\n\n"
-                "Continua a selezionare o clicca 'Conferma Partecipanti'",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return NEW_INTERVENTION_PARTICIPANTS
-        
-        else:
-            # Inserimento manuale
-            participants = [p.strip() for p in update.message.text.split(',')]
-            context.user_data['participants'] = participants
-            
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('SELECT license_plate, model FROM vehicles WHERE is_active = TRUE')
-            vehicles = c.fetchall()
-            conn.close()
-            
-            if vehicles:
-                vehicle_list = "\n".join([f"🚒 {v[0]} - {v[1]}" for v in vehicles])
-                await update.message.reply_text(
-                    f"Mezzi disponibili:\n{vehicle_list}\n\n"
-                    "Inserisci i mezzi utilizzati (separati da virgola, formato: TARGA1, TARGA2):"
-                )
-            else:
-                await update.message.reply_text("Inserisci i mezzi utilizzati (separati da virgola):")
-            return NEW_INTERVENTION_VEHICLES
-
-    async def new_intervention_vehicles(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        # Gestione selezione mezzi dalla tastiera
-        if '🚒' in update.message.text:
-            vehicle_text = update.message.text
-            vehicle_plate = vehicle_text.split('🚒 ')[1].split(' - ')[0].strip()
-            vehicles = [vehicle_plate]
-        else:
-            vehicles = [v.strip() for v in update.message.text.split(',')]
-        
-        # Salva l'intervento CON TIPOLOGIA
-        user = update.effective_user
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO interventions 
-            (report_number, year, exit_time, return_time, address, intervention_type,
-             squad_leader, driver, participants, vehicles_used, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            context.user_data['report_number'],
-            context.user_data['year'],
-            context.user_data['exit_time'],
-            context.user_data['return_time'],
-            context.user_data['address'],
-            context.user_data.get('intervention_type', 'Incendio'),
-            context.user_data['squad_leader'],
-            context.user_data['driver'],
-            json.dumps(context.user_data['participants']),
-            json.dumps(vehicles),
-            user.id
-        ))
-        conn.commit()
-        conn.close()
-        
-        is_admin = self.is_admin(user.id)
-        await update.message.reply_text(
-            "✅ **INTERVENTO REGISTRATO CON SUCCESSO!**\n\n"
-            f"📋 Rapporto: {context.user_data['report_number']}/{context.user_data['year']}\n"
-            f"🔥 Tipologia: {context.user_data.get('intervention_type', 'Incendio')}\n"
-            f"📍 Indirizzo: {context.user_data['address']}",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    # 🔥 VISUALIZZAZIONE INTERVENTI
-    async def show_last_interventions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('''
-            SELECT report_number, year, exit_time, return_time, address, 
-                   intervention_type, squad_leader, driver, vehicles_used
-            FROM interventions 
-            ORDER BY created_at DESC 
-            LIMIT 10
-        ''')
-        interventions = c.fetchall()
-        conn.close()
-        
-        if not interventions:
-            await update.message.reply_text("Nessun intervento registrato.")
-            return
-        
-        response = "📊 **ULTIMI 10 INTERVENTI**\n\n"
-        for i, interv in enumerate(interventions, 1):
-            response += (
-                f"**{i}. Rapporto {interv[0]}/{interv[1]}**\n"
-                f"🔥 {interv[5]}\n"
-                f"📍 {interv[4]}\n"
-                f"🚨 Uscita: {interv[2]}\n"
-                f"✅ Rientro: {interv[3]}\n"
-                f"👨‍🚒 Caposquadra: {interv[6]}\n"
-                f"🚗 Autista: {interv[7]}\n"
-                f"🚒 Mezzi: {', '.join(json.loads(interv[8]))}\n\n"
-            )
-        
-        await update.message.reply_text(response)
-
-    # 🔥 STATISTICHE AVANZATE CON TIPOLOGIA
-    async def show_statistics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        # Statistiche base
-        c.execute('SELECT COUNT(*) FROM interventions')
-        total_interventions = c.fetchone()[0]
-        
-        c.execute('SELECT MIN(exit_time), MAX(exit_time) FROM interventions')
-        date_range = c.fetchone()
-        
-        c.execute('SELECT COUNT(DISTINCT year) FROM interventions')
-        years_count = c.fetchone()[0]
-        
-        c.execute('SELECT DISTINCT year FROM interventions ORDER BY year')
-        years = [str(row[0]) for row in c.fetchall()]
-        
-        # Statistiche per tipologia (NUOVE)
-        c.execute('''
-            SELECT intervention_type, COUNT(*) as count 
-            FROM interventions 
-            GROUP BY intervention_type 
-            ORDER BY count DESC
-        ''')
-        type_stats = c.fetchall()
-        
-        # Statistiche mezzi più utilizzati
-        c.execute('''
-            SELECT vehicles_used, COUNT(*) as count
-            FROM interventions
-            GROUP BY vehicles_used
-            ORDER BY count DESC
-            LIMIT 5
-        ''')
-        vehicle_stats = c.fetchall()
-        
-        conn.close()
-        
-        response = (
-            f"📈 **STATISTICHE INTERVENTI**\n\n"
-            f"🔢 Totale interventi: {total_interventions}\n"
-            f"📅 Anni registrati: {years_count} ({', '.join(years)})\n"
-            f"🚨 Primo intervento: {date_range[0] if date_range[0] else 'N/A'}\n"
-            f"✅ Ultimo intervento: {date_range[1] if date_range[1] else 'N/A'}\n\n"
-        )
-        
-        # Aggiungi statistiche tipologie
-        if type_stats and total_interventions > 0:
-            response += "🔥 **TIPOLOGIE INTERVENTI**\n"
-            for typ, count in type_stats:
-                percentage = (count / total_interventions) * 100
-                response += f"• {typ}: {count} ({percentage:.1f}%)\n"
-            response += "\n"
-        
-        # Aggiungi statistiche mezzi
-        if vehicle_stats:
-            response += "🚒 **MEZZI PIÙ UTILIZZATI**\n"
-            for vehicles, count in vehicle_stats:
-                vehicle_list = ', '.join(json.loads(vehicles))
-                response += f"• {vehicle_list}: {count} interventi\n"
-        
-        await update.message.reply_text(response)
-
-    # 🔥 MODIFICA VIGILE CON SELEZIONE INTERATTIVA
-    async def modifica_vigile_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Avvia modifica informazioni vigile"""
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT id, full_name FROM personnel WHERE is_active = TRUE ORDER BY full_name')
-        vigili = c.fetchall()
-        conn.close()
-        
-        keyboard = [[f"👤 {vigile[1]}"] for vigile in vigili]
-        keyboard.append(['🔙 Indietro'])
-        
-        await update.message.reply_text(
-            "👥 **MODIFICA VIGILE**\n\nSeleziona il vigile da modificare:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return MODIFICA_VIGILE_SELECT
-
-    async def modifica_vigile_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.cancel(update, context)
-        
-        vigile_nome = update.message.text.replace('👤 ', '')
-        context.user_data['vigile_modifica'] = vigile_nome
-        
-        # Recupera info attuali del vigile
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('''
-            SELECT qualification, license_grade, has_nautical_license, is_saf, is_tpss,
-                   squadra_notturna, squadra_serale, squadra_domenicale
-            FROM personnel WHERE full_name = ?
-        ''', (vigile_nome,))
-        info_vigile = c.fetchone()
-        conn.close()
-        
-        qualifica, patente, nautica, saf, tpss, sq_notte, sq_sera, sq_dom = info_vigile
-        
-        # Mostra campi modificabili
-        keyboard = [
-            ['🎓 Qualifica', '📜 Patente'],
-            ['🚢 Nautica', '🛡️ SAF/TPSS'],
-            ['🌙 Squadra Notturna', '🌆 Squadra Serale'],
-            ['📅 Squadra Domenicale', '🔙 Indietro']
-        ]
-        
-        status_info = (
-            f"🎓 Qualifica: {qualifica}\n"
-            f"📜 Patente: {patente}\n"
-            f"🚢 Nautica: {'Sì' if nautica else 'No'}\n"
-            f"🛡️ SAF: {'Sì' if saf else 'No'}\n"
-            f"🛡️ TPSS: {'Sì' if tpss else 'No'}\n"
-            f"🌙 Squadra Notturna: {sq_notte or 'Non impostata'}\n"
-            f"🌆 Squadra Serale: {sq_sera or 'Non impostata'}\n"
-            f"📅 Squadra Domenicale: {sq_dom or 'Non impostata'}"
-        )
-        
-        await update.message.reply_text(
-            f"✏️ **MODIFICA: {vigile_nome}**\n\n{status_info}\n\nSeleziona cosa modificare:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return MODIFICA_CAMPO_SELECT
-
-    async def modifica_campo_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.modifica_vigile_selected(update, context)
-        
-        campo = update.message.text
-        context.user_data['campo_modifica'] = campo
-        
-        if campo == '🎓 Qualifica':
-            keyboard = [['VV', 'CSV'], ['🔙 Indietro']]
-            await update.message.reply_text(
-                "Seleziona la nuova qualifica:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-        elif campo == '📜 Patente':
-            keyboard = [['IIIE', 'III'], ['II', 'I'], ['🔙 Indietro']]
-            await update.message.reply_text(
-                "Seleziona la nuova patente:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-        elif campo == '🚢 Nautica':
-            keyboard = [['✅ Attiva', '❌ Disattiva'], ['🔙 Indietro']]
-            await update.message.reply_text(
-                "Gestisci patente nautica:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-        elif campo == '🛡️ SAF/TPSS':
-            keyboard = [['✅ SAF', '❌ SAF'], ['✅ TPSS', '❌ TPSS'], ['🔙 Indietro']]
-            await update.message.reply_text(
-                "Gestisci SAF/TPSS:",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-        else:
-            # Per le squadre, richiedi inserimento testo
-            await update.message.reply_text(
-                f"Inserisci il nuovo valore per {campo.lower()}:",
-                reply_markup=ReplyKeyboardRemove()
-            )
-        
-        return MODIFICA_NUOVO_VALORE
-
-    async def modifica_nuovo_valore(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.modifica_vigile_selected(update, context)
-        
-        vigile_nome = context.user_data['vigile_modifica']
-        campo = context.user_data['campo_modifica']
-        nuovo_valore = update.message.text
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        # Mappa campi ai nomi colonna
-        mappa_campi = {
-            '🎓 Qualifica': 'qualification',
-            '📜 Patente': 'license_grade',
-            '🌙 Squadra Notturna': 'squadra_notturna',
-            '🌆 Squadra Serale': 'squadra_serale',
-            '📅 Squadra Domenicale': 'squadra_domenicale'
-        }
-        
-        if campo in mappa_campi:
-            colonna = mappa_campi[campo]
-            c.execute(f'UPDATE personnel SET {colonna} = ? WHERE full_name = ?', (nuovo_valore, vigile_nome))
-        elif campo == '🚢 Nautica':
-            nautica = nuovo_valore == '✅ Attiva'
-            c.execute('UPDATE personnel SET has_nautical_license = ? WHERE full_name = ?', (nautica, vigile_nome))
-        elif campo == '🛡️ SAF/TPSS':
-            if nuovo_valore in ['✅ SAF', '❌ SAF']:
-                saf = nuovo_valore == '✅ SAF'
-                c.execute('UPDATE personnel SET is_saf = ? WHERE full_name = ?', (saf, vigile_nome))
-            else:
-                tpss = nuovo_valore == '✅ TPSS'
-                c.execute('UPDATE personnel SET is_tpss = ? WHERE full_name = ?', (tpss, vigile_nome))
-        
-        conn.commit()
-        conn.close()
-        
-        is_admin = self.is_admin(update.effective_user.id)
-        await update.message.reply_text(
-            f"✅ **{campo} aggiornato per {vigile_nome}!**",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    # 🔥 RICERCA RAPPORTO
-    async def search_report_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "Inserisci il numero del rapporto da cercare:",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return SEARCH_REPORT_NUM
-
-    async def search_report_num(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['search_report_num'] = update.message.text
-        await update.message.reply_text("Inserisci l'anno del rapporto:")
-        return SEARCH_REPORT_YEAR
-
-    async def search_report_year(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        report_num = context.user_data['search_report_num']
-        year = update.message.text
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('''
-            SELECT report_number, year, exit_time, return_time, address, 
-                   intervention_type, squad_leader, driver, vehicles_used, participants
-            FROM interventions 
-            WHERE report_number = ? AND year = ?
-        ''', (report_num, year))
-        
-        intervention = c.fetchone()
-        conn.close()
-        
-        user = update.effective_user
-        is_admin = self.is_admin(user.id)
-        
-        if intervention:
-            response = (
-                f"🔍 **RAPPORTO TROVATO**\n\n"
-                f"📋 Rapporto: {intervention[0]}/{intervention[1]}\n"
-                f"🔥 Tipologia: {intervention[5]}\n"
-                f"📍 Indirizzo: {intervention[4]}\n"
-                f"🚨 Uscita: {intervention[2]}\n"
-                f"✅ Rientro: {intervention[3]}\n"
-                f"👨‍🚒 Caposquadra: {intervention[6]}\n"
-                f"🚗 Autista: {intervention[7]}\n"
-                f"🚒 Mezzi: {', '.join(json.loads(intervention[8]))}\n"
-            )
-            
-            if is_admin:
-                response += f"👥 Partecipanti: {', '.join(json.loads(intervention[9]))}\n"
-            
-            await update.message.reply_text(response)
-        else:
-            await update.message.reply_text("❌ Rapporto non trovato.")
-        
-        return ConversationHandler.END
-
-    # 🔥 ESPORTAZIONE DATI
-    async def export_data_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not self.is_admin(user.id):
-            await update.message.reply_text("❌ Solo gli admin possono esportare i dati.")
-            return
-        
-        available_years = self.get_available_years()
-        
-        if not available_years:
-            await update.message.reply_text("❌ Nessun dato disponibile per l'esportazione.")
-            return
-        
-        # Crea tastiera con anni disponibili
-        keyboard = []
-        for year in available_years:
-            keyboard.append([f"📅 Esporta {year}"])
-        
-        keyboard.append(['📊 Esporta Tutto'])
-        keyboard.append(['🔙 Indietro'])
-        
-        await update.message.reply_text(
-            "📊 **ESPORTAZIONE DATI**\n\n"
-            "Seleziona l'anno da esportare:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return EXPORT_SELECT_YEAR
-
-    async def export_selected_year(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Gestisce la selezione dell'anno per l'esportazione"""
-        user = update.effective_user
-        if not self.is_admin(user.id):
-            await update.message.reply_text("❌ Solo gli admin possono esportare i dati.")
-            return ConversationHandler.END
-        
-        message_text = update.message.text
-        
-        if message_text == '🔙 Indietro':
-            is_admin = self.is_admin(user.id)
-            await update.message.reply_text(
-                "Operazione annullata.",
-                reply_markup=self.get_main_keyboard(is_admin)
-            )
-            return ConversationHandler.END
-        
-        if message_text == '📊 Esporta Tutto':
-            return await self.export_all_data(update, context)
-        
-        # Estrai l'anno dal testo del pulsante
-        if message_text.startswith('📅 Esporta '):
-            selected_year = message_text.replace('📅 Esporta ', '').strip()
-            return await self.generate_year_export(update, context, selected_year)
-        
-        await update.message.reply_text("Selezione non valida.")
-        return EXPORT_SELECT_YEAR
-
-    async def generate_year_export(self, update: Update, context: ContextTypes.DEFAULT_TYPE, year):
-        """Genera e invia il file CSV per l'anno specificato"""
-        try:
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('''
-                SELECT report_number, exit_time, return_time, address, intervention_type,
-                       squad_leader, driver, participants, vehicles_used
-                FROM interventions 
-                WHERE year = ? 
-                ORDER BY exit_time
-            ''', (year,))
-            
-            interventions = c.fetchall()
-            conn.close()
-            
-            if not interventions:
-                await update.message.reply_text(f"❌ Nessun intervento trovato per l'anno {year}")
-                return EXPORT_SELECT_YEAR
-            
-            # Crea file CSV in memoria
-            output = io.StringIO()
-            writer = csv.writer(output)
-            
-            # Intestazione migliorata CON TIPOLOGIA
-            writer.writerow([
-                'Rapporto', 'Anno', 'Data Uscita', 'Ora Uscita', 
-                'Data Rientro', 'Ora Rientro', 'Indirizzo', 'Tipologia',
-                'Caposquadra', 'Autista', 'Vigili Partecipanti', 'Mezzi Utilizzati'
-            ])
-            
-            # Dati
-            for interv in interventions:
-                exit_parts = interv[1].split(' ') if interv[1] else ['', '']
-                return_parts = interv[2].split(' ') if interv[2] else ['', '']
-                
-                writer.writerow([
-                    interv[0],  # report_number
-                    year,
-                    exit_parts[0] if len(exit_parts) > 0 else '',
-                    exit_parts[1] if len(exit_parts) > 1 else '',
-                    return_parts[0] if len(return_parts) > 0 else '',
-                    return_parts[1] if len(return_parts) > 1 else '',
-                    interv[3],  # address
-                    interv[4],  # intervention_type (NUOVO)
-                    interv[5],  # squad_leader
-                    interv[6],  # driver
-                    ', '.join(json.loads(interv[7])),  # participants
-                    ', '.join(json.loads(interv[8]))   # vehicles_used
-                ])
-            
-            # Prepara file per download
-            output.seek(0)
-            csv_content = output.getvalue().encode('utf-8')
-            output.close()
-            
-            # Statistiche aggiuntive
-            total_interventions = len(interventions)
-            first_intervention = interventions[0][1] if interventions else "N/A"
-            last_intervention = interventions[-1][1] if interventions else "N/A"
-            
-            # Invia file
-            await update.message.reply_document(
-                document=io.BytesIO(csv_content),
-                filename=f"interventi_{year}.csv",
-                caption=(
-                    f"📊 **ESPORTazione INTERVENTI {year}**\n"
-                    f"🔢 Totale interventi: {total_interventions}\n"
-                    f"📅 Primo intervento: {first_intervention}\n"
-                    f"🔄 Ultimo intervento: {last_intervention}\n"
-                    f"💾 Formato: CSV (Excel compatibile)"
-                )
-            )
-            
-            # Torna al menu esportazione
-            return await self.export_data_menu(update, context)
-            
-        except Exception as e:
-            logger.error(f"Errore durante l'esportazione: {str(e)}")
-            await update.message.reply_text(
-                f"❌ Errore durante l'esportazione: {str(e)}\n"
-                f"Riprova più tardi."
-            )
-            return EXPORT_SELECT_YEAR
-
-    async def export_all_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Esporta tutti i dati indipendentemente dall'anno"""
-        try:
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('''
-                SELECT report_number, year, exit_time, return_time, address, intervention_type,
-                       squad_leader, driver, participants, vehicles_used
-                FROM interventions 
-                ORDER BY year DESC, exit_time
-            ''')
-            
-            interventions = c.fetchall()
-            conn.close()
-            
-            if not interventions:
-                await update.message.reply_text("❌ Nessun intervento trovato nel database")
-                return EXPORT_SELECT_YEAR
-            
-            # Crea file CSV in memoria
-            output = io.StringIO()
-            writer = csv.writer(output)
-            
-            # Intestazione CON TIPOLOGIA
-            writer.writerow([
-                'Rapporto', 'Anno', 'Data Uscita', 'Ora Uscita', 
-                'Data Rientro', 'Ora Rientro', 'Indirizzo', 'Tipologia',
-                'Caposquadra', 'Autista', 'Vigili Partecipanti', 'Mezzi Utilizzati'
-            ])
-            
-            # Dati
-            for interv in interventions:
-                exit_parts = interv[2].split(' ') if interv[2] else ['', '']
-                return_parts = interv[3].split(' ') if interv[3] else ['', '']
-                
-                writer.writerow([
-                    interv[0],  # report_number
-                    interv[1],  # year
-                    exit_parts[0] if len(exit_parts) > 0 else '',
-                    exit_parts[1] if len(exit_parts) > 1 else '',
-                    return_parts[0] if len(return_parts) > 0 else '',
-                    return_parts[1] if len(return_parts) > 1 else '',
-                    interv[4],  # address
-                    interv[5],  # intervention_type (NUOVO)
-                    interv[6],  # squad_leader
-                    interv[7],  # driver
-                    ', '.join(json.loads(interv[8])),  # participants
-                    ', '.join(json.loads(interv[9]))   # vehicles_used
-                ])
-            
-            # Prepara file per download
-            output.seek(0)
-            csv_content = output.getvalue().encode('utf-8')
-            output.close()
-            
-            # Statistiche
-            total_interventions = len(interventions)
-            years = set(interv[1] for interv in interventions)
-            
-            await update.message.reply_document(
-                document=io.BytesIO(csv_content),
-                filename=f"interventi_completo_{datetime.now().strftime('%Y%m%d')}.csv",
-                caption=(
-                    f"📊 **ESPORTazione COMPLETA**\n"
-                    f"🔢 Totale interventi: {total_interventions}\n"
-                    f"📅 Anni coperti: {len(years)} ({', '.join(map(str, sorted(years)))})\n"
-                    f"💾 Formato: CSV (Excel compatibile)"
-                )
-            )
-            
-            # Torna al menu esportazione
-            return await self.export_data_menu(update, context)
-            
-        except Exception as e:
-            logger.error(f"Errore durante l'esportazione completa: {str(e)}")
-            await update.message.reply_text(
-                f"❌ Errore durante l'esportazione: {str(e)}"
-            )
-            return EXPORT_SELECT_YEAR
-
-    # 🔥 GESTIONE RICHIESTE ACCESSO (ADMIN)
-    async def manage_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not self.is_admin(user.id):
-            await update.message.reply_text("❌ Solo gli admin possono gestire le richieste.")
-            return
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT * FROM access_requests WHERE status = "pending"')
-        requests = c.fetchall()
-        conn.close()
-        
-        if not requests:
-            await update.message.reply_text("Nessuna richiesta pendente.")
-            return
-        
-        for req in requests:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Approva", callback_data=f"approve_{req[1]}")],
-                [InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject_{req[1]}")]
-            ])
-            
-            await update.message.reply_text(
-                f"Richiesta da: {req[3]}\n"
-                f"Username: @{req[2]}\n"
-                f"ID: {req[1]}",
-                reply_markup=keyboard
-            )
-
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        user_id = query.from_user.id
-
-        if not self.is_admin(user_id):
-            await query.edit_message_text("❌ Non hai i permessi per questa azione.")
-            return
-        
-        if data.startswith('approve_'):
-            telegram_id = int(data.split('_')[1])
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('UPDATE access_requests SET status = "approved" WHERE telegram_id = ?', (telegram_id,))
-            c.execute('INSERT OR REPLACE INTO users (telegram_id, username, full_name, role, is_active) VALUES (?, ?, ?, ?, ?)', 
-                     (telegram_id, 'username', 'full_name', 'user', True))
-            conn.commit()
-            conn.close()
-            await query.edit_message_text(f"✅ Utente approvato!")
-        elif data.startswith('reject_'):
-            telegram_id = int(data.split('_')[1])
-            conn = sqlite3.connect(DATABASE_NAME)
-            c = conn.cursor()
-            c.execute('UPDATE access_requests SET status = "rejected" WHERE telegram_id = ?', (telegram_id,))
-            conn.commit()
-            conn.close()
-            await query.edit_message_text(f"❌ Richiesta rifiutata.")
-
-    # 🔥 GESTIONE PERSONALE (ADMIN) - AGGIUNGI NUOVO
-    async def start_add_personnel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        qualifications = ["VV", "CSV"]
-        keyboard = [[q] for q in qualifications]
-        keyboard.append(['Annulla'])
-        
-        await update.message.reply_text(
-            "Seleziona la qualifica:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return ADD_PERSONNEL_QUALIFICATION
-
-    async def add_personnel_qualification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        context.user_data['qualification'] = update.message.text
-        await update.message.reply_text("Inserisci nome e cognome:")
-        return ADD_PERSONNEL_NAME
-
-    async def add_personnel_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['full_name'] = update.message.text
-        
-        license_grades = ["IIIE", "III", "II", "I"]
-        keyboard = [[grade] for grade in license_grades]
-        keyboard.append(['Annulla'])
-        
-        await update.message.reply_text(
-            "Seleziona il grado della patente:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return ADD_PERSONNEL_LICENSE
-
-    async def add_personnel_license(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        context.user_data['license_grade'] = update.message.text
-        
-        keyboard = [['Sì', 'No', 'Annulla']]
-        await update.message.reply_text(
-            "Ha patente nautica?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return ADD_PERSONNEL_NAUTICAL
-
-    async def add_personnel_nautical(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        context.user_data['nautical'] = update.message.text == 'Sì'
-        
-        keyboard = [['Sì', 'No', 'Annulla']]
-        await update.message.reply_text(
-            "È SAF?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return ADD_PERSONNEL_SAF
-
-    async def add_personnel_saf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        context.user_data['saf'] = update.message.text == 'Sì'
-        
-        keyboard = [['Sì', 'No', 'Annulla']]
-        await update.message.reply_text(
-            "È TPSS?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return ADD_PERSONNEL_TPSS
-
-    async def add_personnel_tpss(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == 'Annulla':
-            return await self.cancel(update, context)
-        
-        context.user_data['tpss'] = update.message.text == 'Sì'
-        
-        # Salva il personale
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('''
-            INSERT INTO personnel (full_name, qualification, license_grade, 
-                                 has_nautical_license, is_saf, is_tpss)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            context.user_data['full_name'],
-            context.user_data['qualification'],
-            context.user_data['license_grade'],
-            context.user_data['nautical'],
-            context.user_data['saf'],
-            context.user_data['tpss']
-        ))
-        conn.commit()
-        conn.close()
-        
-        user = update.effective_user
-        is_admin = self.is_admin(user.id)
-        await update.message.reply_text(
-            "✅ Personale aggiunto con successo!",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    # 🔥 GESTIONE VIGILI - MODIFICA STATO (mantenuto per compatibilità)
-    async def manage_personnel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Menu per modificare lo stato del personale"""
-        user = update.effective_user
-        if not self.is_admin(user.id):
-            await update.message.reply_text("❌ Solo gli admin possono gestire il personale.")
-            return
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT id, full_name, qualification, license_grade FROM personnel WHERE is_active = TRUE ORDER BY full_name')
-        personnel = c.fetchall()
-        conn.close()
-        
-        if not personnel:
-            await update.message.reply_text("❌ Nessun personale registrato.")
-            return
-        
-        keyboard = []
-        for person in personnel:
-            keyboard.append([f"👤 {person[1]} ({person[2]} - {person[3]})"])
-        keyboard.append(['🔙 Indietro'])
-        
-        await update.message.reply_text(
-            "👥 **GESTIONE PERSONALE**\n\n"
-            "Seleziona il vigile da modificare:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return MANAGE_PERSONNEL_SELECTED
-
-    async def manage_personnel_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            is_admin = self.is_admin(update.effective_user.id)
-            await update.message.reply_text(
-                "Operazione annullata.",
-                reply_markup=self.get_main_keyboard(is_admin)
-            )
-            return ConversationHandler.END
-        
-        # Estrai nome del vigile
-        person_text = update.message.text
-        person_name = person_text.replace('👤 ', '').split(' (')[0].strip()
-        context.user_data['editing_person'] = person_name
-        
-        # Recupera info attuali del vigile
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT qualification, license_grade, has_nautical_license, is_saf, is_tpss FROM personnel WHERE full_name = ?', (person_name,))
-        person_info = c.fetchone()
-        conn.close()
-        
-        qualifica, patente, nautica, saf, tpss = person_info
-        
-        keyboard = [
-            ['🔄 Aggiorna Patente', '⭐ Aggiorna Qualifica'],
-            ['🚢 Patente Nautica', '🛡️ SAF/TPSS'],
-            ['🔙 Indietro']
-        ]
-        
-        status_info = f"🚢 Nautica: {'Sì' if nautica else 'No'}\n🛡️ SAF: {'Sì' if saf else 'No'}\n🛡️ TPSS: {'Sì' if tpss else 'No'}"
-        
-        await update.message.reply_text(
-            f"✏️ **MODIFICA: {person_name}**\n\n"
-            f"📋 Attuale: {qualifica} - {patente}\n"
-            f"{status_info}\n\n"
-            "Cosa vuoi modificare?",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
-        return MANAGE_PERSONNEL_ACTION
-
-    async def manage_personnel_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.manage_personnel_selected(update, context)
-        
-        action = update.message.text
-        person_name = context.user_data['editing_person']
-        
-        if action == '🔄 Aggiorna Patente':
-            license_grades = ["IIIE", "III", "II", "I"]
-            keyboard = [[grade] for grade in license_grades]
-            keyboard.append(['🔙 Indietro'])
-            
-            await update.message.reply_text(
-                "📚 **SELEZIONA NUOVO GRADO PATENTE**",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return UPDATE_LICENSE_CONFIRM
-            
-        elif action == '⭐ Aggiorna Qualifica':
-            qualifications = ["VV", "CSV"]
-            keyboard = [[qual] for qual in qualifications]
-            keyboard.append(['🔙 Indietro'])
-            
-            await update.message.reply_text(
-                "📋 **SELEZIONA NUOVA QUALIFICA**",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return UPDATE_QUALIFICATION_CONFIRM
-            
-        elif action == '🚢 Patente Nautica':
-            keyboard = [['✅ Attiva Nautica', '❌ Disattiva Nautica'], ['🔙 Indietro']]
-            
-            await update.message.reply_text(
-                "🚢 **GESTIONE PATENTE NAUTICA**",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return UPDATE_NAUTICAL_CONFIRM
-            
-        elif action == '🛡️ SAF/TPSS':
-            keyboard = [
-                ['✅ SAF', '❌ SAF'],
-                ['✅ TPSS', '❌ TPSS'],
-                ['🔙 Indietro']
-            ]
-            
-            await update.message.reply_text(
-                "🛡️ **GESTIONE SAF/TPSS**",
-                reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            )
-            return UPDATE_SAF_TPSS_CONFIRM
-
-    async def update_license_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.manage_personnel_selected(update, context)
-        
-        new_license = update.message.text
-        person_name = context.user_data['editing_person']
-        
-        # Aggiorna nel database
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('UPDATE personnel SET license_grade = ? WHERE full_name = ?', (new_license, person_name))
-        conn.commit()
-        conn.close()
-        
-        is_admin = self.is_admin(update.effective_user.id)
-        await update.message.reply_text(
-            f"✅ **PATENTE AGGIORNATA!**\n\n"
-            f"👤 {person_name}\n"
-            f"📚 Nuovo grado: {new_license}",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    async def update_qualification_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.manage_personnel_selected(update, context)
-        
-        new_qualification = update.message.text
-        person_name = context.user_data['editing_person']
-        
-        # Aggiorna nel database
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('UPDATE personnel SET qualification = ? WHERE full_name = ?', (new_qualification, person_name))
-        conn.commit()
-        conn.close()
-        
-        is_admin = self.is_admin(update.effective_user.id)
-        await update.message.reply_text(
-            f"✅ **QUALIFICA AGGIORNATA!**\n\n"
-            f"👤 {person_name}\n"
-            f"⭐ Nuova qualifica: {new_qualification}",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    async def update_nautical_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.manage_personnel_selected(update, context)
-        
-        action = update.message.text
-        person_name = context.user_data['editing_person']
-        has_nautical = action == '✅ Attiva Nautica'
-        
-        # Aggiorna nel database
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('UPDATE personnel SET has_nautical_license = ? WHERE full_name = ?', (has_nautical, person_name))
-        conn.commit()
-        conn.close()
-        
-        is_admin = self.is_admin(update.effective_user.id)
-        status = "ATTIVATA" if has_nautical else "DISATTIVATA"
-        await update.message.reply_text(
-            f"✅ **PATENTE NAUTICA {status}!**\n\n"
-            f"👤 {person_name}\n"
-            f"🚢 Nautica: {'Sì' if has_nautical else 'No'}",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    async def update_saf_tpss_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.text == '🔙 Indietro':
-            return await self.manage_personnel_selected(update, context)
-        
-        action = update.message.text
-        person_name = context.user_data['editing_person']
-        
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        
-        if action in ['✅ SAF', '❌ SAF']:
-            is_saf = action == '✅ SAF'
-            c.execute('UPDATE personnel SET is_saf = ? WHERE full_name = ?', (is_saf, person_name))
-            status = "ATTIVATO" if is_saf else "DISATTIVATO"
-            qualifica = "SAF"
-        else:
-            is_tpss = action == '✅ TPSS'
-            c.execute('UPDATE personnel SET is_tpss = ? WHERE full_name = ?', (is_tpss, person_name))
-            status = "ATTIVATO" if is_tpss else "DISATTIVATO"
-            qualifica = "TPSS"
-        
-        conn.commit()
-        conn.close()
-        
-        is_admin = self.is_admin(update.effective_user.id)
-        await update.message.reply_text(
-            f"✅ **{qualifica} {status}!**\n\n"
-            f"👤 {person_name}\n"
-            f"🛡️ {qualifica}: {'Sì' if status == 'ATTIVATO' else 'No'}",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    # 🔥 GESTIONE MEZZI (ADMIN)
-    async def start_add_vehicle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "Inserisci la targa del mezzo:",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ADD_VEHICLE_PLATE
-
-    async def add_vehicle_plate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data['license_plate'] = update.message.text
-        await update.message.reply_text("Inserisci il modello del mezzo:")
-        return ADD_VEHICLE_MODEL
-
-    async def add_vehicle_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        model = update.message.text
-        license_plate = context.user_data['license_plate']
-        
-        # Salva il mezzo
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO vehicles (license_plate, model) VALUES (?, ?)', (license_plate, model))
-        conn.commit()
-        conn.close()
-        
-        user = update.effective_user
-        is_admin = self.is_admin(user.id)
-        await update.message.reply_text(
-            f"✅ Mezzo {license_plate} aggiunto con successo!",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    # 🔥 HEALTH CHECK
-    async def health_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        conn = sqlite3.connect(DATABASE_NAME)
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM interventions')
-        total_interventions = c.fetchone()[0]
-        
-        c.execute('SELECT COUNT(*) FROM users WHERE is_active = TRUE')
-        total_users = c.fetchone()[0]
-        
-        c.execute('SELECT COUNT(*) FROM personnel WHERE is_active = TRUE')
-        total_personnel = c.fetchone()[0]
-        
-        c.execute('SELECT COUNT(DISTINCT year) FROM interventions')
-        years_count = c.fetchone()[0]
-        
-        conn.close()
-        
-        health_info = (
-            f"🤖 **HEALTH CHECK VIGILI BOT**\n\n"
-            f"✅ **Stato:** Operational\n"
-            f"🔢 **Interventi:** {total_interventions}\n"
-            f"📅 **Anni registrati:** {years_count}\n"
-            f"👥 **Utenti attivi:** {total_users}\n"
-            f"👨‍🚒 **Personale:** {total_personnel}\n"
-            f"📊 **Esportazione:** Per anno selezionato ✅\n"
-            f"🔄 **Backup:** Ogni 15 minuti ✅\n"
-            f"🐍 **Python:** 3.11\n"
-            f"🤖 **Telegram Bot:** 21.7\n\n"
-            f"_Sistema stabile e funzionante_"
-        )
-        
-        await update.message.reply_text(health_info)
-
-    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        is_admin = self.is_admin(user.id)
-        await update.message.reply_text(
-            "Operazione annullata.",
-            reply_markup=self.get_main_keyboard(is_admin)
-        )
-        return ConversationHandler.END
-
-    def setup_handlers(self):
-        """Setup di tutti gli handler"""
-        print("🔧 Configurazione handler in corso...")
-        
-        # Handler base
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("health", self.health_check))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-
-        # Conversazione nuovo intervento CON TIPOLOGIA MIGLIORATA
-        intervention_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^📋 Nuovo Intervento$'), self.start_new_intervention)],
-            states={
-                NEW_INTERVENTION_REPORT_NUM: [MessageHandler(filters.TEXT, self.new_intervention_report_num)],
-                NEW_INTERVENTION_REPORT_PROGRESSIVO: [MessageHandler(filters.TEXT, self.new_intervention_report_progressivo)],
-                NEW_INTERVENTION_YEAR: [MessageHandler(filters.TEXT, self.new_intervention_year)],
-                NEW_INTERVENTION_EXIT_TIME: [MessageHandler(filters.TEXT, self.new_intervention_exit_time)],
-                NEW_INTERVENTION_RETURN_TIME: [MessageHandler(filters.TEXT, self.new_intervention_return_time)],
-                NEW_INTERVENTION_ADDRESS: [MessageHandler(filters.TEXT, self.new_intervention_address)],
-                NEW_INTERVENTION_TYPE: [MessageHandler(filters.TEXT, self.new_intervention_type)],
-                NEW_INTERVENTION_SQUAD_LEADER: [MessageHandler(filters.TEXT, self.new_intervention_squad_leader)],
-                NEW_INTERVENTION_DRIVER: [MessageHandler(filters.TEXT, self.new_intervention_driver)],
-                NEW_INTERVENTION_PARTICIPANTS: [MessageHandler(filters.TEXT, self.new_intervention_participants)],
-                NEW_INTERVENTION_VEHICLES: [MessageHandler(filters.TEXT, self.new_intervention_vehicles)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(intervention_conv)
-
-        # Conversazione modifica vigile
-        modifica_vigile_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^👨‍🚒 Modifica Vigile$'), self.modifica_vigile_start)],
-            states={
-                MODIFICA_VIGILE_SELECT: [MessageHandler(filters.TEXT, self.modifica_vigile_selected)],
-                MODIFICA_CAMPO_SELECT: [MessageHandler(filters.TEXT, self.modifica_campo_selected)],
-                MODIFICA_NUOVO_VALORE: [MessageHandler(filters.TEXT, self.modifica_nuovo_valore)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(modifica_vigile_conv)
-
-        # Conversazione ricarica dati precompilati
-        ricarica_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^🔄 Ricarica Dati Precompilati$'), self.ricarica_dati_precompilati)],
-            states={
-                CONFERMA_RICARICA_DATI: [MessageHandler(filters.TEXT, self.handle_message)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(ricarica_conv)
-
-        # Conversazione ricerca rapporto
-        search_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^🔍 Cerca Rapporto$'), self.search_report_start)],
-            states={
-                SEARCH_REPORT_NUM: [MessageHandler(filters.TEXT, self.search_report_num)],
-                SEARCH_REPORT_YEAR: [MessageHandler(filters.TEXT, self.search_report_year)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(search_conv)
-
-        # Conversazione esportazione dati
-        export_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^📁 Esporta Dati$'), self.export_data_menu)],
-            states={
-                EXPORT_SELECT_YEAR: [MessageHandler(filters.TEXT, self.export_selected_year)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(export_conv)
-
-        # Conversazione aggiungi personale (solo admin)
-        personnel_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^➕ Aggiungi Personale$'), self.start_add_personnel)],
-            states={
-                ADD_PERSONNEL_QUALIFICATION: [MessageHandler(filters.TEXT, self.add_personnel_qualification)],
-                ADD_PERSONNEL_NAME: [MessageHandler(filters.TEXT, self.add_personnel_name)],
-                ADD_PERSONNEL_LICENSE: [MessageHandler(filters.TEXT, self.add_personnel_license)],
-                ADD_PERSONNEL_NAUTICAL: [MessageHandler(filters.TEXT, self.add_personnel_nautical)],
-                ADD_PERSONNEL_SAF: [MessageHandler(filters.TEXT, self.add_personnel_saf)],
-                ADD_PERSONNEL_TPSS: [MessageHandler(filters.TEXT, self.add_personnel_tpss)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(personnel_conv)
-
-        # Conversazione gestione personale (solo admin)
-        personnel_manage_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^✏️ Gestione Vigili$'), self.manage_personnel)],
-            states={
-                MANAGE_PERSONNEL_SELECTED: [MessageHandler(filters.TEXT, self.manage_personnel_selected)],
-                MANAGE_PERSONNEL_ACTION: [MessageHandler(filters.TEXT, self.manage_personnel_action)],
-                UPDATE_LICENSE_CONFIRM: [MessageHandler(filters.TEXT, self.update_license_confirm)],
-                UPDATE_QUALIFICATION_CONFIRM: [MessageHandler(filters.TEXT, self.update_qualification_confirm)],
-                UPDATE_NAUTICAL_CONFIRM: [MessageHandler(filters.TEXT, self.update_nautical_confirm)],
-                UPDATE_SAF_TPSS_CONFIRM: [MessageHandler(filters.TEXT, self.update_saf_tpss_confirm)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(personnel_manage_conv)
-
-        # Conversazione aggiungi mezzo (solo admin)
-        vehicle_conv = ConversationHandler(
-            entry_points=[MessageHandler(filters.Regex('^🚗 Aggiungi Mezzo$'), self.start_add_vehicle)],
-            states={
-                ADD_VEHICLE_PLATE: [MessageHandler(filters.TEXT, self.add_vehicle_plate)],
-                ADD_VEHICLE_MODEL: [MessageHandler(filters.TEXT, self.add_vehicle_model)],
-            },
-            fallbacks=[CommandHandler('cancel', self.cancel)]
-        )
-        self.application.add_handler(vehicle_conv)
-
-        print(f"✅ {len(self.application.handlers)} gruppi di handler configurati")
-
-    def run(self):
-    
-        """Avvia il bot CORRETTO"""
-        self.application = Application.builder().token(self.token).build()
-    
-    # ✅ IMPOSTA HANDLER PRIMA del run_polling
-        self.setup_handlers()
-    
-        logger.info("🤖 Bot Vigili del Fuoco avviato con TIPOLOGIA INTERVENTI!")
-    
-        # ⚠️ USA SOLO POLLING - Webhook richiede dipendenze aggiuntive
-        print("🔍 Bot avviato in modalità POLLING")
-        self.application.run_polling()
-
-# 🔥 SERVER FLASK PER KEEP-ALIVE - COMPLETO
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from datetime import datetime, timedelta
+import asyncio
+import os
 from flask import Flask
 import threading
+import requests
+import time
+import base64
+import json
+import csv
+from io import StringIO, BytesIO
+from telegram.error import BadRequest
+import re
 
+# === CONFIGURAZIONE ===
+DATABASE_NAME = 'turni_vvf.db'
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+SUPER_USER_IDS = [1816045269]  # Tu come super user
+ADMIN_IDS = [1816045269, 653425963]  # Admin (includi te stesso)
+USER_IDS = []  # Verrà popolato dal database
+
+# Configurazione backup GitHub
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+GIST_ID = os.environ.get('GIST_ID')
+
+# Configurazione squadre
+SQUADRE_NOTTURNE = ["An", "Bn", "Cn", "S1n", "S2n"]
+SQUADRE_SERALI = ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]
+SQUADRE_FESTIVE = ["A", "B", "C", "D"]
+
+# Tipi di turno
+TIPI_TURNO = ["notte", "sera", "festivo", "festa_nazionale", "ore_singole"]
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# === DATABASE ===
+def init_db():
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+
+    # Tabella utenti
+    c.execute('''CREATE TABLE IF NOT EXISTS utenti
+                 (user_id INTEGER PRIMARY KEY,
+                  username TEXT,
+                  nome TEXT,
+                  telefono TEXT,
+                  ruolo TEXT DEFAULT 'in_attesa',
+                  squadra_notte TEXT,
+                  squadra_sera TEXT,
+                  squadra_festiva TEXT,
+                  data_richiesta TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  data_approvazione TIMESTAMP)''')
+
+    # Tabella turni
+    c.execute('''CREATE TABLE IF NOT EXISTS turni
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data DATE,
+                  tipo_turno TEXT,
+                  squadra TEXT,
+                  descrizione TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Tabella cambi
+    c.execute('''CREATE TABLE IF NOT EXISTS cambi
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id_da INTEGER,
+                  user_id_a INTEGER,
+                  turno_id INTEGER,
+                  tipo_scambio TEXT, -- 'dare', 'ricevere', 'scambiare'
+                  stato TEXT DEFAULT 'pending', -- 'pending', 'confermato', 'completato'
+                  data_creazione TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (user_id_da) REFERENCES utenti (user_id),
+                  FOREIGN KEY (user_id_a) REFERENCES utenti (user_id),
+                  FOREIGN KEY (turno_id) REFERENCES turni (id))''')
+
+    # Tabella feste_nazionali
+    c.execute('''CREATE TABLE IF NOT EXISTS feste_nazionali
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data DATE,
+                  nome_festa TEXT,
+                  squadra TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Inserisci super user e admin
+    for admin_id in ADMIN_IDS:
+        ruolo = 'super_user' if admin_id in SUPER_USER_IDS else 'admin'
+        c.execute('''INSERT OR IGNORE INTO utenti 
+                     (user_id, nome, ruolo, data_approvazione) 
+                     VALUES (?, 'Admin', ?, CURRENT_TIMESTAMP)''', (admin_id, ruolo))
+
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# === FUNZIONI UTILITY ===
+def is_super_user(user_id):
+    return user_id in SUPER_USER_IDS
+
+def is_admin(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("SELECT ruolo FROM utenti WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result and result[0] in ['super_user', 'admin']
+
+def is_user_approved(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("SELECT ruolo FROM utenti WHERE user_id = ? AND ruolo IN ('super_user', 'admin', 'user')", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+def get_user_squadre(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("SELECT squadra_notte, squadra_sera, squadra_festiva FROM utenti WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result if result else (None, None, None)
+
+def get_user_nome(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("SELECT nome FROM utenti WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else f"User_{user_id}"
+
+def get_richieste_in_attesa():
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT user_id, username, nome, telefono, data_richiesta 
+                 FROM utenti WHERE ruolo = 'in_attesa' ORDER BY data_richiesta''')
+    result = c.fetchall()
+    conn.close()
+    return result
+
+def get_utenti_approvati():
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT user_id, username, nome, telefono, ruolo, data_approvazione 
+                 FROM utenti WHERE ruolo IN ('super_user', 'admin', 'user') ORDER BY nome''')
+    result = c.fetchall()
+    conn.close()
+    return result
+
+def approva_utente(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''UPDATE utenti SET ruolo = 'user', data_approvazione = CURRENT_TIMESTAMP 
+                 WHERE user_id = ?''', (user_id,))
+    conn.commit()
+    conn.close()
+
+def rimuovi_utente(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM utenti WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def aggiorna_squadre_utente(user_id, squadra_notte, squadra_sera, squadra_festiva):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''UPDATE utenti SET squadra_notte = ?, squadra_sera = ?, squadra_festiva = ?
+                 WHERE user_id = ?''', (squadra_notte, squadra_sera, squadra_festiva, user_id))
+    conn.commit()
+    conn.close()
+
+# === FUNZIONI TURNI E CALENDARIO ===
+def get_turni_per_data(data):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("SELECT * FROM turni WHERE data = ? ORDER BY tipo_turno", (data,))
+    result = c.fetchall()
+    conn.close()
+    return result
+
+def get_turni_per_squadra(squadra):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute("SELECT * FROM turni WHERE squadra = ? ORDER BY data", (squadra,))
+    result = c.fetchall()
+    conn.close()
+    return result
+
+def get_turni_futuri_per_utente(user_id):
+    squadra_notte, squadra_sera, squadra_festiva = get_user_squadre(user_id)
+    oggi = datetime.now().date()
+    
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    
+    # Cerca turni per le squadre dell'utente
+    query = '''SELECT * FROM turni 
+               WHERE squadra IN (?, ?, ?) AND data >= ?
+               ORDER BY data LIMIT 20'''
+    c.execute(query, (squadra_notte, squadra_sera, squadra_festiva, oggi))
+    turni_diretti = c.fetchall()
+    
+    # Cerca cambi pendenti per l'utente
+    query = '''SELECT t.*, c.tipo_scambio, c.user_id_da, c.user_id_a
+               FROM cambi c
+               JOIN turni t ON c.turno_id = t.id
+               WHERE (c.user_id_da = ? OR c.user_id_a = ?) AND c.stato = 'pending'
+               ORDER BY t.data'''
+    c.execute(query, (user_id, user_id))
+    cambi_pendenti = c.fetchall()
+    
+    conn.close()
+    
+    return turni_diretti, cambi_pendenti
+
+def get_prossimi_turni_utente(user_id):
+    squadra_notte, squadra_sera, squadra_festiva = get_user_squadre(user_id)
+    oggi = datetime.now().date()
+    
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    
+    # Prossime 2 sere
+    c.execute('''SELECT * FROM turni 
+                 WHERE squadra = ? AND tipo_turno = 'sera' AND data >= ?
+                 ORDER BY data LIMIT 2''', (squadra_sera, oggi))
+    prossime_sere = c.fetchall()
+    
+    # Prossime 2 notti
+    c.execute('''SELECT * FROM turni 
+                 WHERE squadra = ? AND tipo_turno = 'notte' AND data >= ?
+                 ORDER BY data LIMIT 2''', (squadra_notte, oggi))
+    prossime_notti = c.fetchall()
+    
+    # Prossimo turno festivo
+    c.execute('''SELECT * FROM turni 
+                 WHERE squadra = ? AND tipo_turno = 'festivo' AND data >= ?
+                 ORDER BY data LIMIT 1''', (squadra_festiva, oggi))
+    prossimo_festivo = c.fetchone()
+    
+    # Prossima festa nazionale
+    c.execute('''SELECT * FROM feste_nazionali 
+                 WHERE data >= ? ORDER BY data LIMIT 1''', (oggi,))
+    prossima_festa = c.fetchone()
+    
+    conn.close()
+    
+    return {
+        'sere': prossime_sere,
+        'notti': prossime_notti,
+        'festivo': prossimo_festivo,
+        'festa_nazionale': prossima_festa
+    }
+
+def get_cambi_pendenti_utente(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    
+    # Cambi che devo cedere
+    c.execute('''SELECT c.*, t.data, t.tipo_turno, u.nome as nome_a
+                 FROM cambi c
+                 JOIN turni t ON c.turno_id = t.id
+                 JOIN utenti u ON c.user_id_a = u.user_id
+                 WHERE c.user_id_da = ? AND c.stato = 'pending'
+                 ORDER BY t.data''', (user_id,))
+    cambi_da_cedere = c.fetchall()
+    
+    # Cambi che devo ricevere
+    c.execute('''SELECT c.*, t.data, t.tipo_turno, u.nome as nome_da
+                 FROM cambi c
+                 JOIN turni t ON c.turno_id = t.id
+                 JOIN utenti u ON c.user_id_da = u.user_id
+                 WHERE c.user_id_a = ? AND c.stato = 'pending'
+                 ORDER BY t.data''', (user_id,))
+    cambi_da_ricevere = c.fetchall()
+    
+    conn.close()
+    
+    return cambi_da_cedere, cambi_da_ricevere
+
+def formatta_data_per_visualizzazione(data_str):
+    """Converte la data dal formato DB a quello di visualizzazione"""
+    try:
+        data = datetime.strptime(data_str, '%Y-%m-%d')
+        return data.strftime('%d/%m/%Y')
+    except:
+        return data_str
+
+def formatta_turno_notte_per_visualizzazione(data_str, squadra):
+    """Formatta i turni notte come richiesto: 'S1n - venerdì 31 ottobre su sabato 01 novembre'"""
+    try:
+        data = datetime.strptime(data_str, '%Y-%m-%d')
+        giorno_precedente = data - timedelta(days=1)
+        
+        # Nomi dei giorni in italiano
+        giorni_settimana = ['lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato', 'domenica']
+        giorno_prec_nome = giorni_settimana[giorno_precedente.weekday()]
+        giorno_corrente_nome = giorni_settimana[data.weekday()]
+        
+        return f"{squadra} - {giorno_prec_nome} {giorno_precedente.strftime('%d %B')} su {giorno_corrente_nome} {data.strftime('%d %B')}"
+    except:
+        return f"{squadra} - {data_str}"
+
+# === GESTIONE CAMBI ===
+def crea_cambio(user_id_da, user_id_a, turno_id, tipo_scambio):
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''INSERT INTO cambi (user_id_da, user_id_a, turno_id, tipo_scambio)
+                 VALUES (?, ?, ?, ?)''', (user_id_da, user_id_a, turno_id, tipo_scambio))
+    cambio_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return cambio_id
+
+def get_turni_utente_per_tipo(user_id, tipo_turno):
+    squadra_notte, squadra_sera, squadra_festiva = get_user_squadre(user_id)
+    oggi = datetime.now().date()
+    
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    
+    squadra = None
+    if tipo_turno == 'notte':
+        squadra = squadra_notte
+    elif tipo_turno == 'sera':
+        squadra = squadra_sera
+    elif tipo_turno == 'festivo':
+        squadra = squadra_festiva
+    
+    if squadra:
+        c.execute('''SELECT * FROM turni 
+                     WHERE squadra = ? AND tipo_turno = ? AND data >= ?
+                     ORDER BY data LIMIT 25''', (squadra, tipo_turno, oggi))
+        result = c.fetchall()
+    else:
+        result = []
+    
+    conn.close()
+    return result
+
+# === TASTIERA FISICA ===
+def crea_tastiera_fisica(user_id):
+    if not is_user_approved(user_id):
+        return ReplyKeyboardMarkup([[KeyboardButton("🚀 Richiedi Accesso")]], resize_keyboard=True)
+
+    tastiera = [
+        [KeyboardButton("Chi tocca"), KeyboardButton("Prossimi turni")],
+        [KeyboardButton("Aggiungi cambio"), KeyboardButton("Statistiche")],
+        [KeyboardButton("Le mie squadre"), KeyboardButton("Estrazione")],
+        [KeyboardButton("/start 🔄"), KeyboardButton("Help")]
+    ]
+
+    if is_admin(user_id):
+        tastiera.append([KeyboardButton("gestisci richieste"), KeyboardButton("modifica cambio")])
+
+    return ReplyKeyboardMarkup(tastiera, resize_keyboard=True, is_persistent=True)
+
+# === HANDLER START ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    
+    # Pulisci context user_data
+    for key in list(context.user_data.keys()):
+        del context.user_data[key]
+    
+    # Registra utente se non esiste
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''INSERT OR IGNORE INTO utenti (user_id, username, nome, ruolo) 
+                 VALUES (?, ?, ?, 'in_attesa')''', 
+                 (user_id, update.effective_user.username, user_name))
+    conn.commit()
+    conn.close()
+
+    if not is_user_approved(user_id):
+        # Notifica admin della nuova richiesta
+        richieste = get_richieste_in_attesa()
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"🆕 NUOVA RICHIESTA ACCESSO BOT TURNI\n\nUser: {user_name}\nID: {user_id}\nUsername: @{update.effective_user.username}\nRichieste in attesa: {len(richieste)}"
+                )
+            except Exception as e:
+                print(f"Errore notifica admin: {e}")
+
+        await update.message.reply_text(
+            "✅ Richiesta di accesso inviata agli amministratori.\nAttendi l'approvazione!",
+            reply_markup=crea_tastiera_fisica(user_id)
+        )
+        return
+
+    welcome_text = ""
+    if is_super_user(user_id):
+        welcome_text = f"👑 BENVENUTO SUPER USER {user_name}!"
+    elif is_admin(user_id):
+        welcome_text = f"👨‍💻 BENVENUTO ADMIN {user_name}!"
+    else:
+        welcome_text = f"👤 BENVENUTO {user_name}!"
+    
+    await update.message.reply_text(
+        welcome_text + "\n\nUsa la tastiera in basso per navigare tra le funzioni.",
+        reply_markup=crea_tastiera_fisica(user_id)
+    )
+
+# === CHI TOCCA ===
+async def chi_tocca(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_approved(user_id):
+        return
+    
+    oggi = datetime.now().date()
+    
+    # Trova il sabato della settimana corrente
+    giorno_settimana = oggi.weekday()  # 0=lunedì, 6=domenica
+    sabato_corrente = oggi + timedelta(days=(5 - giorno_settimana))
+    
+    messaggio = "👥 **CHI TOCCA OGGI E NEI PROSSIMI GIORNI**\n\n"
+    
+    # Turno della sera odierna
+    turni_oggi = get_turni_per_data(oggi.isoformat())
+    turno_sera_oggi = next((t for t in turni_oggi if t[2] == 'sera'), None)
+    if turno_sera_oggi:
+        messaggio += f"🌙 **Sera di oggi ({oggi.strftime('%d/%m')}):** {turno_sera_oggi[3]}\n"
+    
+    # Turno della notte che viene
+    domani = oggi + timedelta(days=1)
+    turni_domani = get_turni_per_data(domani.isoformat())
+    turno_notte_domani = next((t for t in turni_domani if t[2] == 'notte'), None)
+    if turno_notte_domani:
+        descrizione = formatta_turno_notte_per_visualizzazione(domani.isoformat(), turno_notte_domani[3])
+        messaggio += f"🌃 **Notte di stasera:** {descrizione}\n"
+    
+    # Turno festivo del weekend corrente
+    turno_festivo_sabato = get_turni_per_data(sabato_corrente.isoformat())
+    turno_festivo = next((t for t in turno_festivo_sabato if t[2] == 'festivo'), None)
+    if turno_festivo:
+        messaggio += f"🎉 **Festivo weekend ({sabato_corrente.strftime('%d/%m')}-{(sabato_corrente + timedelta(days=1)).strftime('%d/%m')}):** {turno_festivo[3]}\n"
+    
+    # Prossime 2 festività nazionali
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+    c.execute('''SELECT * FROM feste_nazionali 
+                 WHERE data >= ? ORDER BY data LIMIT 2''', (oggi,))
+    prossime_feste = c.fetchall()
+    conn.close()
+    
+    if prossime_feste:
+        messaggio += "\n🎊 **PROSSIME FESTIVITÀ NAZIONALI:**\n"
+        for festa in prossime_feste:
+            data_festa = datetime.strptime(festa[1], '%Y-%m-%d').strftime('%d/%m/%Y')
+            messaggio += f"• {data_festa}: {festa[2]} - Squadra: {festa[3]}\n"
+    
+    # Verifica se l'utente è coinvolto in qualche turno
+    squadra_notte, squadra_sera, squadra_festiva = get_user_squadre(user_id)
+    
+    coinvolto = False
+    if turno_sera_oggi and turno_sera_oggi[3] == squadra_sera:
+        coinvolto = True
+        messaggio += "\n🚒 **SEI DI TURNO** stasera!\n"
+    
+    if turno_notte_domani and turno_notte_domani[3] == squadra_notte:
+        coinvolto = True
+        messaggio += "\n🚒 **SEI DI TURNO** stanotte!\n"
+    
+    if turno_festivo and turno_festivo[3] == squadra_festiva:
+        coinvolto = True
+        messaggio += "\n🚒 **SEI DI TURNO** nel weekend!\n"
+    
+    # Controlla cambi/sostituzioni
+    cambi_da_cedere, cambi_da_ricevere = get_cambi_pendenti_utente(user_id)
+    if cambi_da_cedere or cambi_da_ricevere:
+        messaggio += "\n🔄 **HAI CAMBI IN SOSPESO** - controlla in 'Prossimi turni'\n"
+    
+    await update.message.reply_text(messaggio)
+
+# === PROSSIMI TURNI ===
+async def prossimi_turni(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_approved(user_id):
+        return
+    
+    prossimi = get_prossimi_turni_utente(user_id)
+    cambi_da_cedere, cambi_da_ricevere = get_cambi_pendenti_utente(user_id)
+    
+    messaggio = "📅 **I TUOI PROSSIMI TURNI**\n\n"
+    
+    # Prossime 2 sere
+    if prossimi['sere']:
+        messaggio += "🌙 **PROSSIME 2 SERE:**\n"
+        for turno in prossimi['sere']:
+            data_formattata = formatta_data_per_visualizzazione(turno[1])
+            messaggio += f"• {data_formattata}: {turno[3]}\n"
+        messaggio += "\n"
+    
+    # Prossime 2 notti
+    if prossimi['notti']:
+        messaggio += "🌃 **PROSSIME 2 NOTTI:**\n"
+        for turno in prossimi['notti']:
+            descrizione = formatta_turno_notte_per_visualizzazione(turno[1], turno[3])
+            messaggio += f"• {descrizione}\n"
+        messaggio += "\n"
+    
+    # Prossimo turno festivo
+    if prossimi['festivo']:
+        data_festivo = formatta_data_per_visualizzazione(prossimi['festivo'][1])
+        messaggio += f"🎉 **PROSSIMO FESTIVO:** {data_festivo}: {prossimi['festivo'][3]}\n\n"
+    
+    # Prossima festa nazionale
+    if prossimi['festa_nazionale']:
+        data_festa = formatta_data_per_visualizzazione(prossimi['festa_nazionale'][1])
+        messaggio += f"🎊 **PROSSIMA FESTA NAZIONALE:** {data_festa}: {prossimi['festa_nazionale'][2]} - {prossimi['festa_nazionale'][3]}\n\n"
+    
+    # Cambi pendenti
+    if cambi_da_cedere or cambi_da_ricevere:
+        messaggio += "🔄 **CAMBI IN SOSPESO:**\n"
+        
+        if cambi_da_cedere:
+            messaggio += "📤 **Da cedere a:**\n"
+            for cambio in cambi_da_cedere:
+                data_turno = formatta_data_per_visualizzazione(cambio[7])
+                tipo_turno = cambio[8]
+                nome_destinatario = cambio[9]
+                messaggio += f"• {data_turno} ({tipo_turno}) → {nome_destinatario}\n"
+        
+        if cambi_da_ricevere:
+            messaggio += "📥 **Da ricevere da:**\n"
+            for cambio in cambi_da_ricevere:
+                data_turno = formatta_data_per_visualizzazione(cambio[7])
+                tipo_turno = cambio[8]
+                nome_cedente = cambio[9]
+                messaggio += f"• {data_turno} ({tipo_turno}) ← {nome_cedente}\n"
+    
+    if not any(prossimi.values()) and not cambi_da_cedere and not cambi_da_ricevere:
+        messaggio += "🎉 Non hai turni in programma per il prossimo futuro!"
+    
+    await update.message.reply_text(messaggio)
+
+# === AGGIUNGI CAMBIO ===
+async def aggiungi_cambio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_approved(user_id):
+        return
+    
+    # Ottieni lista utenti approvati (escludendo se stesso)
+    utenti = get_utenti_approvati()
+    utenti_filtrati = [u for u in utenti if u[0] != user_id]
+    
+    if not utenti_filtrati:
+        await update.message.reply_text("❌ Non ci sono altri utenti nel sistema con cui fare cambi.")
+        return
+    
+    keyboard = []
+    for utente in utenti_filtrati[:25]:  # Limite di 25 utenti per callback
+        user_id_u, username, nome, telefono, ruolo, data_approvazione = utente
+        display_name = f"{nome} (@{username})" if username else nome
+        keyboard.append([InlineKeyboardButton(display_name, callback_data=f"cambio_sel_{user_id_u}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    context.user_data['cambio'] = {'fase': 'selezione_utente'}
+    
+    await update.message.reply_text(
+        "🔄 **AGGIUNGI CAMBIO**\n\n"
+        "Seleziona la persona con cui hai concordato il cambio:",
+        reply_markup=reply_markup
+    )
+
+async def gestisci_selezione_utente_cambio(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id_selezionato: int):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        return
+    
+    context.user_data['cambio']['user_id_a'] = user_id_selezionato
+    context.user_data['cambio']['fase'] = 'tipo_scambio'
+    
+    nome_utente = get_user_nome(user_id_selezionato)
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("📤 Dare turno", callback_data="scambio_dare"),
+            InlineKeyboardButton("📥 Ricevere turno", callback_data="scambio_ricevere")
+        ],
+        [InlineKeyboardButton("🔄 Scambiare turno", callback_data="scambio_scambiare")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🔄 **TIPO DI SCAMBIO**\n\n"
+        f"Con: {nome_utente}\n\n"
+        f"Seleziona il tipo di scambio:",
+        reply_markup=reply_markup
+    )
+
+async def gestisci_tipo_scambio(update: Update, context: ContextTypes.DEFAULT_TYPE, tipo_scambio: str):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        return
+    
+    context.user_data['cambio']['tipo_scambio'] = tipo_scambio
+    context.user_data['cambio']['fase'] = 'selezione_tipologia_turno'
+    
+    tipo_testo = {
+        'dare': "📤 DARE un turno",
+        'ricevere': "📥 RICEVERE un turno", 
+        'scambiare': "🔄 SCAMBIARE turni"
+    }.get(tipo_scambio, tipo_scambio)
+    
+    nome_utente = get_user_nome(context.user_data['cambio']['user_id_a'])
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🌃 Notte", callback_data="tipo_notte"),
+            InlineKeyboardButton("🌙 Sera", callback_data="tipo_sera"),
+            InlineKeyboardButton("🎉 Festivo", callback_data="tipo_festivo")
+        ],
+        [InlineKeyboardButton("⏰ Ore singole", callback_data="tipo_ore_singole")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🔄 **SELEZIONA TIPOLOGIA TURNO**\n\n"
+        f"{tipo_testo} con: {nome_utente}\n\n"
+        f"Seleziona la tipologia di turno:",
+        reply_markup=reply_markup
+    )
+
+async def gestisci_selezione_tipologia_turno(update: Update, context: ContextTypes.DEFAULT_TYPE, tipo_turno: str):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        return
+    
+    user_id_corrente = query.from_user.id
+    user_id_a = context.user_data['cambio']['user_id_a']
+    tipo_scambio = context.user_data['cambio']['tipo_scambio']
+    
+    context.user_data['cambio']['tipo_turno'] = tipo_turno
+    
+    if tipo_turno == 'ore_singole':
+        context.user_data['cambio']['fase'] = 'inserimento_ore_singole'
+        await query.edit_message_text(
+            "⏰ **ORE SINGOLE**\n\n"
+            "Inserisci la data nel formato GGMMAA (es: 251224 per il 25/12/2024):"
+        )
+        return
+    
+    # Per gli altri tipi di turno, mostra i turni disponibili
+    if tipo_scambio == 'dare':
+        # Mostro i turni dell'altra persona che io devo fare
+        user_id_da_visualizzare = user_id_a
+    elif tipo_scambio == 'ricevere':
+        # Mostro i miei turni che l'altra persona deve fare
+        user_id_da_visualizzare = user_id_corrente
+    else:  # scambiare
+        context.user_data['cambio']['fase'] = 'selezione_turno_primario'
+        user_id_da_visualizzare = user_id_corrente
+    
+    turni = get_turni_utente_per_tipo(user_id_da_visualizzare, tipo_turno)
+    
+    if not turni:
+        await query.edit_message_text(
+            f"❌ Nessun turno {tipo_turno} disponibile per questa selezione."
+        )
+        return
+    
+    keyboard = []
+    for turno in turni[:25]:  # Limite di 25 turni
+        id_turno, data, tipo, squadra, descrizione, created_at = turno
+        data_formattata = formatta_data_per_visualizzazione(data)
+        
+        if tipo_turno == 'notte':
+            testo_bottone = formatta_turno_notte_per_visualizzazione(data, squadra)
+        else:
+            testo_bottone = f"{data_formattata}: {squadra}"
+        
+        keyboard.append([InlineKeyboardButton(testo_bottone, callback_data=f"turno_sel_{id_turno}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    messaggio = f"📅 **SELEZIONA TURNO {tipo_turno.upper()}**\n\n"
+    
+    if tipo_scambio == 'dare':
+        messaggio += f"Seleziona il turno di {get_user_nome(user_id_a)} che devi fare:\n"
+    elif tipo_scambio == 'ricevere':
+        messaggio += f"Seleziona il tuo turno che {get_user_nome(user_id_a)} deve fare:\n"
+    else:
+        messaggio += f"Seleziona il TUO turno da scambiare:\n"
+    
+    await query.edit_message_text(messaggio, reply_markup=reply_markup)
+
+# === GESTIONE MESSAGGI DI TESTO ===
+async def gestisci_messaggio_testo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    testo = update.message.text
+    
+    if not is_user_approved(user_id):
+        if testo == "🚀 Richiedi Accesso":
+            await start(update, context)
+        return
+    
+    # Gestione comandi dalla tastiera fisica
+    if testo == "Chi tocca":
+        await chi_tocca(update, context)
+    elif testo == "Prossimi turni":
+        await prossimi_turni(update, context)
+    elif testo == "Aggiungi cambio":
+        await aggiungi_cambio(update, context)
+    elif testo == "Statistiche":
+        await statistiche(update, context)
+    elif testo == "Le mie squadre":
+        await mie_squadre(update, context)
+    elif testo == "Estrazione":
+        await estrazione_dati(update, context)
+    elif testo == "gestisci richieste" and is_admin(user_id):
+        await gestisci_richieste(update, context)
+    elif testo == "modifica cambio" and is_admin(user_id):
+        await modifica_cambio(update, context)
+    elif testo == "/start 🔄":
+        await start(update, context)
+    elif testo == "Help":
+        await help_command(update, context)
+    
+    # Gestione flusso inserimento ore singole
+    elif 'cambio' in context.user_data and context.user_data['cambio']['fase'] == 'inserimento_ore_singole':
+        await gestisci_inserimento_ore_singole(update, context, testo)
+
+async def gestisci_inserimento_ore_singole(update: Update, context: ContextTypes.DEFAULT_TYPE, testo: str):
+    # Implementazione semplificata per le ore singole
+    await update.message.reply_text(
+        "⏰ **ORE SINGOLE**\n\n"
+        "Funzionalità ore singole in sviluppo. Usa i turni predefiniti per ora."
+    )
+    context.user_data.pop('cambio', None)
+
+# === FUNZIONI AGGIUNTIVE (DA COMPLETARE) ===
+async def statistiche(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_approved(user_id):
+        return
+    
+    # Implementazione statistica semplificata
+    await update.message.reply_text(
+        "📊 **STATISTICHE**\n\n"
+        "Funzionalità statistiche in sviluppo.\n"
+        "Qui vedrai il bilancio delle sostituzioni con tutti i VVF."
+    )
+
+async def mie_squadre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_approved(user_id):
+        return
+    
+    squadra_notte, squadra_sera, squadra_festiva = get_user_squadre(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton("👀 Visualizza", callback_data="squadre_visualizza")],
+        [InlineKeyboardButton("✏️ Cambia squadra", callback_data="squadre_cambia")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    messaggio = "👥 **LE MIE SQUADRE**\n\n"
+    
+    if any([squadra_notte, squadra_sera, squadra_festiva]):
+        messaggio += f"🌃 **Notturna:** {squadra_notte or 'Non impostata'}\n"
+        messaggio += f"🌙 **Serale:** {squadra_sera or 'Non impostata'}\n"
+        messaggio += f"🎉 **Festiva:** {squadra_festiva or 'Non impostata'}\n"
+    else:
+        messaggio += "❌ Non hai ancora impostato le tue squadre.\n"
+    
+    messaggio += "\nSeleziona un'opzione:"
+    
+    await update.message.reply_text(messaggio, reply_markup=reply_markup)
+
+async def estrazione_dati(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_approved(user_id):
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📅 Calendario turni", callback_data="export_calendario")],
+        [InlineKeyboardButton("📊 I miei turni", callback_data="export_miei_turni")],
+        [InlineKeyboardButton("👥 Utenti", callback_data="export_utenti")],
+        [InlineKeyboardButton("🚒 Vigili", callback_data="export_vigili")]
+    ]
+    
+    if is_admin(user_id):
+        keyboard.append([InlineKeyboardButton("🔄 Backup completo", callback_data="export_backup")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📤 **ESTRAZIONE DATI**\n\n"
+        "Seleziona il tipo di estrazione:",
+        reply_markup=reply_markup
+    )
+
+async def gestisci_richieste(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📋 Richieste in attesa", callback_data="richieste_attesa")],
+        [InlineKeyboardButton("👥 Utenti approvati", callback_data="utenti_approvati")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    richieste = get_richieste_in_attesa()
+    utenti = get_utenti_approvati()
+    
+    messaggio = "👥 **GESTIONE RICHIESTE**\n\n"
+    messaggio += f"📋 Richieste in attesa: {len(richieste)}\n"
+    messaggio += f"👥 Utenti approvati: {len(utenti)}\n\n"
+    messaggio += "Seleziona un'operazione:"
+    
+    await update.message.reply_text(messaggio, reply_markup=reply_markup)
+
+async def modifica_cambio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    
+    await update.message.reply_text(
+        "✏️ **MODIFICA CAMBIO**\n\n"
+        "Funzionalità in sviluppo.\n"
+        "Qui potrai modificare o rimuovere i cambi esistenti."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    messaggio = """🆘 **HELP - GUIDA ALL'USO**
+
+**FUNZIONALITÀ PRINCIPALI:**
+
+👥 **CHI TOCCA** - Mostra i turni di oggi, stanotte, il weekend e le prossime festività
+
+📅 **PROSSIMI TURNI** - I tuoi prossimi turni e cambi in sospeso
+
+🔄 **AGGIUNGI CAMBIO** - Organizza cambi con altri vigili
+
+📊 **STATISTICHE** - Bilancio ore con gli altri vigili
+
+👥 **LE MIE SQUADRE** - Visualizza o modifica le tue squadre
+
+📤 **ESTRAZIONE** - Scarica dati in formato CSV
+
+**PER AMMINISTRATORI:**
+👥 **GESTISCI RICHIESTE** - Approva nuovi utenti
+✏️ **MODIFICA CAMBIO** - Gestisci cambi esistenti
+
+**COMANDI:**
+/start - Riavvia il bot
+Help - Questo messaggio
+
+📌 **SUGGERIMENTI:**
+• Usa sempre la tastiera in basso
+• Segui i flussi guidati per i cambi
+• Controlla sempre i dati prima di confermare
+"""
+    await update.message.reply_text(messaggio)
+
+# === GESTIONE CALLBACK QUERY ===
+async def gestisci_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    callback_data = query.data
+    
+    try:
+        await query.answer()
+    except BadRequest:
+        return
+    
+    # Gestione selezione utente per cambio
+    if callback_data.startswith("cambio_sel_"):
+        user_id_selezionato = int(callback_data.replace("cambio_sel_", ""))
+        await gestisci_selezione_utente_cambio(update, context, user_id_selezionato)
+    
+    # Gestione tipo scambio
+    elif callback_data.startswith("scambio_"):
+        tipo_scambio = callback_data.replace("scambio_", "")
+        await gestisci_tipo_scambio(update, context, tipo_scambio)
+    
+    # Gestione tipologia turno
+    elif callback_data.startswith("tipo_"):
+        tipo_turno = callback_data.replace("tipo_", "")
+        await gestisci_selezione_tipologia_turno(update, context, tipo_turno)
+    
+    # Gestione richieste admin
+    elif callback_data == "richieste_attesa":
+        await mostra_richieste_attesa(update, context)
+    elif callback_data == "utenti_approvati":
+        await mostra_utenti_approvati(update, context)
+    elif callback_data.startswith("approva_"):
+        user_id_approvare = int(callback_data.replace("approva_", ""))
+        await approva_utente_handler(update, context, user_id_approvare)
+    elif callback_data.startswith("rimuovi_"):
+        user_id_rimuovere = int(callback_data.replace("rimuovi_", ""))
+        await conferma_rimozione_utente(update, context, user_id_rimuovere)
+    
+    # Gestione squadre
+    elif callback_data == "squadre_visualizza":
+        await visualizza_squadre(update, context)
+    elif callback_data == "squadre_cambia":
+        await cambia_squadra(update, context)
+
+async def mostra_richieste_attesa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    richieste = get_richieste_in_attesa()
+    
+    if not richieste:
+        await query.edit_message_text("✅ Nessuna richiesta di accesso in sospeso.")
+        return
+
+    prima_richiesta = richieste[0]
+    user_id_rich, username, nome, telefono, data_richiesta = prima_richiesta
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Approva", callback_data=f"approva_{user_id_rich}"),
+            InlineKeyboardButton("❌ Rifiuta", callback_data=f"rimuovi_{user_id_rich}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"👤 **RICHIESTA ACCESSO**\n\n"
+        f"🆔 ID: {user_id_rich}\n"
+        f"👤 Nome: {nome}\n"
+        f"📱 Username: @{username}\n"
+        f"📞 Telefono: {telefono or 'Non fornito'}\n"
+        f"📅 Data: {data_richiesta}",
+        reply_markup=reply_markup
+    )
+
+async def approva_utente_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    query = update.callback_query
+    approva_utente(user_id)
+    
+    # Notifica l'utente approvato
+    try:
+        await context.bot.send_message(
+            user_id,
+            "✅ **ACCESSO APPROVATO!**\n\n"
+            "La tua richiesta di accesso al bot dei turni è stata approvata.\n"
+            "Usa /start per iniziare!"
+        )
+    except:
+        pass
+    
+    await query.edit_message_text(f"✅ Utente {user_id} approvato con successo!")
+
+async def conferma_rimozione_utente(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    query = update.callback_query
+    rimuovi_utente(user_id)
+    await query.edit_message_text(f"❌ Utente {user_id} rimosso.")
+
+async def visualizza_squadre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    squadra_notte, squadra_sera, squadra_festiva = get_user_squadre(user_id)
+    
+    messaggio = "👥 **LE TUE SQUADRE**\n\n"
+    messaggio += f"🌃 **Squadra notturna:** {squadra_notte or 'Non impostata'}\n"
+    messaggio += f"🌙 **Squadra serale:** {squadra_sera or 'Non impostata'}\n"
+    messaggio += f"🎉 **Squadra festiva:** {squadra_festiva or 'Non impostata'}\n\n"
+    messaggio += "Usa 'Cambia squadra' per modificare."
+    
+    await query.edit_message_text(messaggio)
+
+async def cambia_squadra(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    context.user_data['cambia_squadra'] = {'fase': 'notte'}
+    
+    keyboard = []
+    for squadra in SQUADRE_NOTTURNE:
+        keyboard.append([InlineKeyboardButton(squadra, callback_data=f"squadra_notte_{squadra}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🌃 **CAMBIASQUADRA NOTTURNA**\n\n"
+        "Seleziona la tua squadra notturna:",
+        reply_markup=reply_markup
+    )
+
+# === SISTEMA BACKUP GITHUB (simile al bot originale) ===
+def backup_database_to_gist():
+    if not GITHUB_TOKEN:
+        print("❌ Token GitHub non configurato - backup disabilitato")
+        return False
+    
+    try:
+        with open(DATABASE_NAME, 'rb') as f:
+            db_content = f.read()
+        
+        db_base64 = base64.b64encode(db_content).decode('utf-8')
+        
+        files = {
+            'turni_vvf_backup.json': {
+                'content': json.dumps({
+                    'timestamp': datetime.now().isoformat(),
+                    'database_size': len(db_content),
+                    'database_base64': db_base64,
+                    'backup_type': 'automatic'
+                })
+            }
+        }
+        
+        headers = {
+            'Authorization': f'token {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        if GIST_ID:
+            url = f'https://api.github.com/gists/{GIST_ID}'
+            data = {'files': files}
+            response = requests.patch(url, headers=headers, json=data)
+        else:
+            url = 'https://api.github.com/gists'
+            data = {
+                'description': f'Backup Turni VVF - {datetime.now().strftime("%Y-%m-%d %H:%M")}',
+                'public': False,
+                'files': files
+            }
+            response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code in [200, 201]:
+            print("✅ Backup su Gist completato")
+            return True
+        else:
+            print(f"❌ Errore backup Gist: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Errore durante backup: {str(e)}")
+        return False
+
+def restore_database_from_gist():
+    if not GITHUB_TOKEN or not GIST_ID:
+        print("❌ Token o Gist ID non configurati - restore disabilitato")
+        return False
+    
+    try:
+        headers = {
+            'Authorization': f'token {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        url = f'https://api.github.com/gists/{GIST_ID}'
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            gist_data = response.json()
+            backup_file = gist_data['files'].get('turni_vvf_backup.json')
+            
+            if backup_file:
+                backup_content = json.loads(backup_file['content'])
+                db_base64 = backup_content['database_base64']
+                
+                db_content = base64.b64decode(db_base64)
+                with open(DATABASE_NAME, 'wb') as f:
+                    f.write(db_content)
+                
+                print("✅ Database ripristinato da backup")
+                return True
+        return False
+            
+    except Exception as e:
+        print(f"❌ Errore durante restore: {str(e)}")
+        return False
+
+# === SERVER FLASK PER RENDER ===
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🤖 Bot Vigili del Fuoco - ONLINE 🟢"
+    return "🤖 Bot Turni VVF - ONLINE 🟢"
 
 @app.route('/health')
 def health():
     return "OK"
 
-@app.route('/ping')
-def ping():
-    return f"PONG - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-@app.route('/status')
-def status():
-    return "Bot Active - Keep-alive: ✅"
-
-@app.route('/keep-alive')
-def keep_alive():
-    return f"KEEP-ALIVE ACTIVE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
 def run_flask():
-    """Avvia il server Flask in un thread separato"""
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=10000, debug=False)
 
+# === MAIN ===
 def main():
-    BOT_TOKEN = os.environ.get('BOT_TOKEN')
-    RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL')
+    # Ripristino da backup se disponibile
+    print("🔄 Verifica backup...")
+    restore_database_from_gist()
     
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN non configurato")
-        return
-    
-    print("🚀 Avvio bot Vigili del Fuoco...")
-    
-    # 1. AVVIA SERVER FLASK PER KEEP-ALIVE
+    # Avvia server Flask in thread separato
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print("✅ Flask server started on port 5000")
     
-    # 2. AVVIA KEEP-ALIVE AGGRESSIVO (5 minuti)
-    start_keep_alive()
+    # Crea application
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    # 3. RIPRISTINO DATABASE
-    if not enhanced_restore_on_startup():
-        print("📝 Inizializzazione database nuovo...")
+    # Aggiungi handler
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, gestisci_messaggio_testo))
+    application.add_handler(CallbackQueryHandler(gestisci_callback))
     
-    # 4. CONFIGURA ADMIN E AVVIA BOT
-    bot = VigiliBot(BOT_TOKEN)
-    bot.setup_admins_and_users()
-    
-    # 5. AVVIA BACKUP
-    start_backup_system()
-    
-    # 6. AVVIA IL BOT
-    bot.run()
+    # Avvia bot
+    print("🤖 Bot Turni VVF avviato!")
+    application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
