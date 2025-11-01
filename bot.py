@@ -46,77 +46,6 @@ DATA_INIZIO_CALENDARIO = datetime(2025, 11, 1).date()
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# === DATABASE ===
-def init_db():
-    conn = sqlite3.connect(DATABASE_NAME)
-    c = conn.cursor()
-
-    # Tabella utenti
-    c.execute('''CREATE TABLE IF NOT EXISTS utenti
-                 (user_id INTEGER PRIMARY KEY,
-                  username TEXT,
-                  nome TEXT,
-                  cognome TEXT,
-                  qualifica TEXT,
-                  grado_patente_terrestre TEXT,
-                  patente_nautica BOOLEAN DEFAULT 0,
-                  saf BOOLEAN DEFAULT 0,
-                  tpss BOOLEAN DEFAULT 0,
-                  atp BOOLEAN DEFAULT 0,
-                  squadra_notte TEXT,
-                  squadra_sera TEXT,
-                  squadra_festiva TEXT,
-                  ruolo TEXT DEFAULT 'in_attesa',
-                  data_richiesta TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  data_approvazione TIMESTAMP)''')
-
-    # Tabella turni
-    c.execute('''CREATE TABLE IF NOT EXISTS turni
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  data DATE,
-                  tipo_turno TEXT,
-                  squadra TEXT,
-                  descrizione TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-
-    # Tabella cambi
-    c.execute('''CREATE TABLE IF NOT EXISTS cambi
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id_da INTEGER,
-                  user_id_a INTEGER,
-                  turno_id INTEGER,
-                  tipo_scambio TEXT, -- 'dare', 'ricevere', 'scambiare'
-                  stato TEXT DEFAULT 'pending', -- 'pending', 'confermato', 'completato'
-                  data_creazione TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (user_id_da) REFERENCES utenti (user_id),
-                  FOREIGN KEY (user_id_a) REFERENCES utenti (user_id),
-                  FOREIGN KEY (turno_id) REFERENCES turni (id))''')
-
-    # Tabella feste_nazionali
-    c.execute('''CREATE TABLE IF NOT EXISTS feste_nazionali
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  data DATE,
-                  nome_festa TEXT,
-                  squadra TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-
-    # Inserisci super user e admin
-    for admin_id in ADMIN_IDS:
-        ruolo = 'super_user' if admin_id in SUPER_USER_IDS else 'admin'
-        c.execute('''INSERT OR IGNORE INTO utenti 
-                     (user_id, nome, cognome, qualifica, grado_patente_terrestre, 
-                      patente_nautica, saf, tpss, atp, squadra_notte, squadra_sera, squadra_festiva, ruolo, data_approvazione) 
-                     VALUES (?, 'Admin', 'Admin', 'VV', 'IIIE', 0, 0, 0, 0, 'Bn', 'S7', 'D', ?, CURRENT_TIMESTAMP)''', 
-                     (admin_id, ruolo))
-
-    conn.commit()
-    conn.close()
-    
-    # Genera il calendario automatico
-    genera_calendario_automatico()
-
-init_db()
-
 # === GENERAZIONE CALENDARIO AUTOMATICO ===
 def genera_calendario_automatico():
     """Genera automaticamente il calendario dei turni per i prossimi 5 anni"""
@@ -215,6 +144,77 @@ def genera_calendario_automatico():
     conn.commit()
     conn.close()
     print("✅ Calendario generato automaticamente per 5 anni!")
+
+# === DATABASE ===
+def init_db():
+    conn = sqlite3.connect(DATABASE_NAME)
+    c = conn.cursor()
+
+    # Tabella utenti
+    c.execute('''CREATE TABLE IF NOT EXISTS utenti
+                 (user_id INTEGER PRIMARY KEY,
+                  username TEXT,
+                  nome TEXT,
+                  cognome TEXT,
+                  qualifica TEXT,
+                  grado_patente_terrestre TEXT,
+                  patente_nautica BOOLEAN DEFAULT 0,
+                  saf BOOLEAN DEFAULT 0,
+                  tpss BOOLEAN DEFAULT 0,
+                  atp BOOLEAN DEFAULT 0,
+                  squadra_notte TEXT,
+                  squadra_sera TEXT,
+                  squadra_festiva TEXT,
+                  ruolo TEXT DEFAULT 'in_attesa',
+                  data_richiesta TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  data_approvazione TIMESTAMP)''')
+
+    # Tabella turni
+    c.execute('''CREATE TABLE IF NOT EXISTS turni
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data DATE,
+                  tipo_turno TEXT,
+                  squadra TEXT,
+                  descrizione TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Tabella cambi
+    c.execute('''CREATE TABLE IF NOT EXISTS cambi
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id_da INTEGER,
+                  user_id_a INTEGER,
+                  turno_id INTEGER,
+                  tipo_scambio TEXT, -- 'dare', 'ricevere', 'scambiare'
+                  stato TEXT DEFAULT 'pending', -- 'pending', 'confermato', 'completato'
+                  data_creazione TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (user_id_da) REFERENCES utenti (user_id),
+                  FOREIGN KEY (user_id_a) REFERENCES utenti (user_id),
+                  FOREIGN KEY (turno_id) REFERENCES turni (id))''')
+
+    # Tabella feste_nazionali
+    c.execute('''CREATE TABLE IF NOT EXISTS feste_nazionali
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  data DATE,
+                  nome_festa TEXT,
+                  squadra TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Inserisci super user e admin
+    for admin_id in ADMIN_IDS:
+        ruolo = 'super_user' if admin_id in SUPER_USER_IDS else 'admin'
+        c.execute('''INSERT OR IGNORE INTO utenti 
+                     (user_id, nome, cognome, qualifica, grado_patente_terrestre, 
+                      patente_nautica, saf, tpss, atp, squadra_notte, squadra_sera, squadra_festiva, ruolo, data_approvazione) 
+                     VALUES (?, 'Admin', 'Admin', 'VV', 'IIIE', 0, 0, 0, 0, 'Bn', 'S7', 'D', ?, CURRENT_TIMESTAMP)''', 
+                     (admin_id, ruolo))
+
+    conn.commit()
+    conn.close()
+    
+    # Genera il calendario automatico
+    genera_calendario_automatico()
+
+init_db()
 
 # === FUNZIONI UTILITY ===
 def is_super_user(user_id):
@@ -740,9 +740,9 @@ async def mie_squadre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messaggio = "👥 **LE MIE SQUADRE**\n\n"
     
     if any([squadra_notte, squadra_sera, squadra_festiva]):
-        messaggio += f"🌃 **Notturna:** {squadra_notte or 'Non impostata'}\n"
-        messaggio += f"🌙 **Serale:** {squadra_sera or 'Non impostata'}\n"
-        messaggio += f"🎉 **Festiva:** {squadra_festiva or 'Non impostata'}\n"
+        messaggio += f"🌃 **Squadra notturna:** {squadra_notte or 'Non impostata'}\n"
+        messaggio += f"🌙 **Squadra serale:** {squadra_sera or 'Non impostata'}\n"
+        messaggio += f"🎉 **Squadra festiva:** {squadra_festiva or 'Non impostata'}\n"
     else:
         messaggio += "❌ Non hai ancora impostato le tue squadre.\n"
     
